@@ -98,6 +98,23 @@ export const api = {
     return invoke('deploy_pack', { target, plan });
   },
 
+  /**
+   * Закрывает запущенный лаунчер на время установки. Возвращает, был ли он
+   * запущен (фронт по этому флагу решает, открывать ли его обратно).
+   * Никогда не реджектится в ошибку установки.
+   */
+  closeLauncher(launcher: LauncherKind): Promise<boolean> {
+    return invoke('close_launcher', { launcher });
+  },
+
+  /**
+   * Открывает лаунчер после установки (только если был запущен на старте).
+   * Best-effort: неуспех глотает вызыватель — установка уже успешна.
+   */
+  reopenLauncher(exe: string | null): Promise<string> {
+    return invoke('reopen_launcher', { exe });
+  },
+
   suggestWorldName(target: GameTarget, worldName: string): Promise<string> {
     return invoke('suggest_world_name', { target, worldName });
   },

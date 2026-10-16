@@ -53,6 +53,8 @@ fn main() {
             commands::icon_data_url,
             commands::resource_pack_icon,
             commands::deploy_pack,
+            commands::close_launcher,
+            commands::reopen_launcher,
             commands::suggest_world_name,
             commands::launch_game,
             commands::oauth_start,

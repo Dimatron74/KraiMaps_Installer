@@ -147,6 +147,12 @@ export const useInstallStore = defineStore('install', {
     wipeConfirmed: false,
     /** Заметка про TLauncher для экрана Done (предвыбор версии пропущен). */
     tlauncherNote: null as string | null,
+    /**
+     * Лаунчер работал на старте установки (замер до первого бэкенд-вызова —
+     * бэкенд сам закрывает Modrinth/TLauncher при create/ensure и съел бы
+     * сигнал). По флагу deploy() решает, открывать ли его обратно.
+     */
+    launcherWasRunning: false,
   }),
 
   getters: {
@@ -227,6 +233,10 @@ export const useInstallStore = defineStore('install', {
     },
 
     reset() {
+      // Флоу брошен после закрытия лаунчера (экраны wipe/conflict → домой):
+      // возвращаем его, иначе останется закрытым. Первой строкой — ниже
+      // launcher уже занулен. Флаг сбросит сам экшен.
+      void this.endInstallWork();
       this.step = 'file';
       this.zipPath = '';
       this.pack = null;
@@ -437,6 +447,33 @@ export const useInstallStore = defineStore('install', {
       }
     },
 
+    /**
+     * Закрывает запущенный лаунчер до первого бэкенд-вызова и запоминает,
+     * работал ли он (OR-накопление: путь через create и путь через deploy
+     * дополняют друг друга, а не затирают). Ручной папке закрывать нечего.
+     */
+    async beginInstallWork() {
+      const launcher = this.launcher;
+      if (!launcher || launcher.kind === 'manual') return;
+      try {
+        this.launcherWasRunning =
+          (await api.closeLauncher(launcher.kind)) || this.launcherWasRunning;
+      } catch {
+        // Не-закрытие — не повод останавливать установку.
+      }
+    },
+
+    /**
+     * Возвращает лаунчер, если мы его закрывали (и на успехе, и на провале).
+     * Молча: установка уже завершена, шум ни к чему. Флаг сбрасываем сразу,
+     * чтобы повторный вызов не открыл его дважды.
+     */
+    async endInstallWork() {
+      if (!this.launcherWasRunning) return;
+      this.launcherWasRunning = false;
+      await api.reopenLauncher(this.launcher?.exe_path ?? null).catch(() => {});
+    },
+
     async createNewTarget() {
       const pack = this.pack;
       const launcher = this.launcher;
@@ -458,6 +495,10 @@ export const useInstallStore = defineStore('install', {
         );
         return;
       }
+      // Закрываем после мгновенных проверок, до первого бэкенд-вызова:
+      // бэкенд сам закрывает Modrinth/TLauncher при create/ensure и съел бы
+      // сигнал «был запущен».
+      await this.beginInstallWork();
       const wasStep = this.step;
       this.busy = true;
       this.statusLine = `Создаём инстанс «${this.siteTitle ?? pack.world_name}»…`;
@@ -507,6 +548,7 @@ export const useInstallStore = defineStore('install', {
           ) ?? launcher;
         await this.proceedAfterTarget();
       } catch (e) {
+        await this.endInstallWork();
         this.fail(e, wasStep === 'deploying' ? 'target' : wasStep);
       }
     },
@@ -575,6 +617,9 @@ export const useInstallStore = defineStore('install', {
         );
         return;
       }
+      // Ванилла выше ушла без бэкенд-вызовов (закроем в deploy),
+      // проверка версии мгновенная — закрываем только перед работой.
+      await this.beginInstallWork();
       this.statusLine = 'Готовим версию игры…';
       this.step = 'deploying';
       const unlisten = await listen<StageEvent>('provision-progress', (event) => {
@@ -612,6 +657,7 @@ export const useInstallStore = defineStore('install', {
           ) ?? launcher;
         await this.proceedAfterTarget();
       } catch (e) {
+        await this.endInstallWork();
         this.fail(e, wasStep === 'deploying' ? 'target' : wasStep);
       } finally {
         unlisten();
@@ -677,6 +723,9 @@ export const useInstallStore = defineStore('install', {
       this.busy = true;
       this.statusLine = 'Устанавливаем…';
       this.progress = null;
+      // Путь через существующую цель (без create): замеряем здесь.
+      // Путь через create уже замерен раньше — OR-накопление в экшене.
+      await this.beginInstallWork();
       const unlisten = await listen<StageEvent>('deploy-progress', (event) => {
         this.progress = event.payload;
       });
@@ -700,6 +749,8 @@ export const useInstallStore = defineStore('install', {
         this.fail(e, 'target');
       } finally {
         unlisten();
+        // Reopen — и на успехе, и на провале: раз закрыли, надо вернуть.
+        await this.endInstallWork();
       }
     },
 

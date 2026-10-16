@@ -68,15 +68,6 @@ async function pickManualFolder() {
             {{ l.targets.length === 0 ? 'Инстансов пока нет — создадим новый' : `Инстансов: ${l.targets.length}` }}
           </template>
         </p>
-        <p
-          v-if="l.kind === 'modrinth' && store.detection?.modrinth_running"
-          class="mt-1 text-xs text-warning-400"
-        >
-          Modrinth App не поддерживает установку в фоне — при установке он будет автоматически закрыт.
-        </p>
-        <p v-if="l.kind === 'tlauncher'" class="mt-1 text-xs text-warning-400">
-          Для подготовки версии TLauncher будет автоматически закрыт на время установки.
-        </p>
       </button>
     </div>
 

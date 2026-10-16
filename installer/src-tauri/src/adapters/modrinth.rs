@@ -13,11 +13,11 @@
 //!   старте подхватывает.
 
 use crate::domain::{sanitize_display_name, slugify, GameTarget, InstallError, LauncherKind, LoaderKind};
-use crate::services::detect::close_modrinth;
+use crate::services::detect::close_launcher;
 use std::path::{Path, PathBuf};
 
 /// Создаёт профиль Modrinth App. Запущенное приложение перед записью
-/// автоматически закрывается (`close_modrinth`); результат закрытия
+/// автоматически закрывается (`close_launcher`); результат закрытия
 /// игнорируется осознанно — установка продолжается в любом случае.
 /// `icon_path` — файл из `prepare_instance_icon`; кладём копией в профиль
 /// и прописываем `icon_path`, но только если такая колонка реально есть
@@ -30,7 +30,7 @@ pub fn create_modrinth_profile(
     loader_version: Option<&str>,
     icon_path: Option<&Path>,
 ) -> Result<GameTarget, InstallError> {
-    let _ = close_modrinth();
+    let _ = close_launcher(LauncherKind::Modrinth);
     // Защита в глубину: диапазон ("[40,)") вместо точной версии роняет
     // запуск профиля («No loader version selected») — не пишем никогда.
     if loader != LoaderKind::Vanilla {

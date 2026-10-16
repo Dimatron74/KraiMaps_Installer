@@ -417,20 +417,7 @@ pub(crate) fn running_launcher_processes() -> Vec<RunningLauncher> {
     sys.refresh_processes(ProcessesToUpdate::All, true);
     let mut out = Vec::new();
     for proc in sys.processes().values() {
-        let name = proc.name().to_string_lossy().to_lowercase();
-        let stem = name.strip_suffix(".exe").unwrap_or(&name);
-        let kind = [&PRISM, &PINECONE, &POLYMC, &MULTIMC]
-            .into_iter()
-            .find(|fam| fam.exe_prefixes.iter().any(|p| stem == *p))
-            .map(|fam| fam.kind)
-            .or_else(|| {
-                if name == "modrinth app.exe" || name == "modrinthapp.exe" || name == "modrinth-app" {
-                    Some(LauncherKind::Modrinth)
-                } else {
-                    None
-                }
-            });
-        if let Some(kind) = kind {
+        if let Some(kind) = process_kind(proc) {
             if let Some(exe) = proc.exe().map(|p| p.to_path_buf()) {
                 out.push(RunningLauncher { kind, exe });
             }
@@ -439,38 +426,74 @@ pub(crate) fn running_launcher_processes() -> Vec<RunningLauncher> {
     out
 }
 
-/// Аккуратно закрывает Modrinth App перед записью в `app.db`: просит
-/// процессы завершиться и ждёт их ухода (до ~10 с). Возвращает `true`,
-/// если процессов не осталось. `false` — не ошибка: установка всё равно
-/// продолжается (эксперимент показал, что запись проходит и на живую базу,
-/// а профиль подхватывается после ручного перезапуска приложения).
-pub fn close_modrinth() -> bool {
+/// Вид процесса по имени exe: Prism-семейство — по префиксам, Modrinth — по
+/// именам, TLauncher — java-процессы, чей exe лежит под `.tlauncher`
+/// (лаунчер; игра — из Mojang-рантайма, её не трогаем). Единая точка для
+/// детекта запущенных и закрытия.
+fn process_kind(proc: &sysinfo::Process) -> Option<LauncherKind> {
+    let name = proc.name().to_string_lossy().to_lowercase();
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    if let Some(fam) = [&PRISM, &PINECONE, &POLYMC, &MULTIMC]
+        .into_iter()
+        .find(|fam| fam.exe_prefixes.iter().any(|p| stem == *p))
+    {
+        return Some(fam.kind);
+    }
+    if name == "modrinth app.exe" || name == "modrinthapp.exe" || name == "modrinth-app" {
+        return Some(LauncherKind::Modrinth);
+    }
+    if (name == "java.exe" || name == "javaw.exe" || name == "java")
+        && proc
+            .exe()
+            .is_some_and(|e| e.to_string_lossy().to_lowercase().contains(".tlauncher"))
+    {
+        return Some(LauncherKind::Tlauncher);
+    }
+    None
+}
+
+/// Аккуратно закрывает лаунчер перед установкой: просит процессы завершиться
+/// и ждёт их ухода (до ~10 с). Возвращает `true`, если лаунчер был запущен, —
+/// фронт по этому флагу решает, открывать ли его обратно. Был закрыт —
+/// `false`, трогать после установки не надо. Не-закрытие — не ошибка:
+/// установка продолжается (fail-open, как раньше у Modrinth).
+pub fn close_launcher(kind: LauncherKind) -> bool {
     use sysinfo::{ProcessesToUpdate, System};
+    if kind == LauncherKind::Manual {
+        return false;
+    }
     let mut sys = System::new();
+    let mut was_running = false;
     for _ in 0..40 {
         sys.refresh_processes(ProcessesToUpdate::All, true);
         let mut alive = false;
         for proc in sys.processes().values() {
-            let name = proc.name().to_string_lossy().to_lowercase();
-            if name == "modrinth app.exe"
-                || name == "modrinthapp.exe"
-                || name == "modrinth-app"
-            {
-                alive = true;
-                proc.kill();
+            if process_kind(proc) != Some(kind) {
+                continue;
             }
+            alive = true;
+            was_running = true;
+            proc.kill();
         }
         if !alive {
-            return true;
+            return was_running;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    // Последний шанс: проверить, ушли ли за время ожидания.
-    sys.refresh_processes(ProcessesToUpdate::All, true);
-    !sys.processes().values().any(|proc| {
-        let name = proc.name().to_string_lossy().to_lowercase();
-        name == "modrinth app.exe" || name == "modrinthapp.exe" || name == "modrinth-app"
-    })
+    was_running
+}
+
+/// Открывает лаунчер после установки (без аргументов — просто окно приложения).
+/// Только если он был запущен на старте (флаг от `close_launcher` — его
+/// хранит фронт): закрытый не трогаем. Возвращает команду для «Подробнее».
+pub fn reopen_launcher(exe: &Path) -> Result<String, crate::domain::InstallError> {
+    if !exe.is_file() {
+        return Err(crate::domain::InstallError::NoLauncher);
+    }
+    std::process::Command::new(exe)
+        .spawn()
+        .map_err(|e| crate::domain::InstallError::LaunchFailed(format!("{}: {e}", exe.display())))?;
+    Ok(exe.display().to_string())
 }
 
 /// Exe Prism из регистрации протокола `prismlauncher://`.
@@ -1236,6 +1259,17 @@ mod tests {
         assert_eq!(ours[0].targets.len(), 1);
         assert_eq!(ours[0].targets[0].launcher, LauncherKind::Polymc);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn manual_kind_never_closes() {
+        assert!(!close_launcher(LauncherKind::Manual));
+    }
+
+    #[test]
+    fn reopen_without_exe_is_an_error() {
+        assert!(reopen_launcher(Path::new("")).is_err());
+        assert!(reopen_launcher(&std::env::temp_dir().join("kraimaps-no-such.exe")).is_err());
     }
 
     #[test]

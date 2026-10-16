@@ -133,6 +133,27 @@ pub async fn create_instance(
     .map_err(CmdError::from)
 }
 
+/// Закрывает запущенный лаунчер на время установки. Возвращает, был ли он
+/// запущен (фронт по этому флагу решает, открывать ли его обратно).
+/// Никогда не ошибается: не-закрытие — не повод останавливать установку.
+#[tauri::command]
+pub async fn close_launcher(launcher: LauncherKind) -> bool {
+    tauri::async_runtime::spawn_blocking(move || detect::close_launcher(launcher))
+        .await
+        .unwrap_or(false)
+}
+
+/// Открывает лаунчер после установки (только если был запущен на старте —
+/// это решает фронт по флагу `close_launcher`). Ошибка (нет exe, не
+/// стартует) — в `CmdError`, фронт её глотает молча: установка уже успешна.
+#[tauri::command]
+pub async fn reopen_launcher(exe: Option<String>) -> Cmd<String> {
+    let exe = exe.map(PathBuf::from).ok_or(InstallError::NoLauncher)?;
+    tauri::async_runtime::spawn_blocking(move || detect::reopen_launcher(&exe))
+        .await?
+        .map_err(CmdError::from)
+}
+
 /// Прямой деплой модели в цель. Прогресс — событиями `deploy-progress`.
 #[tauri::command]
 pub async fn deploy_pack(

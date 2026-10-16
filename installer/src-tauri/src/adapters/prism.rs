@@ -59,12 +59,19 @@ pub fn create_mmc_instance(
         }));
     }
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join("instance.cfg"),
-        format!(
-            "ConfigVersion=1.3\nInstanceType=OneSix\nManagedPack=false\nname={display_name}\n"
-        ),
-    )?;
+    // Иконка — ДО первой записи cfg, cfg — один раз и сразу с iconKey:
+    // запущенный лаунчер читает cfg в окне между созданием и допиской ключа
+    // и кэширует дефолтную иконку навсегда (изменение содержимого cfg вотчер
+    // директории не сообщает — доказано логом MultiMC: discovery между
+    // записью cfg и допиской iconKey).
+    let icon_key = set_prism_icon(data_dir, &slug, icon_path);
+    let mut cfg = format!(
+        "ConfigVersion=1.3\nInstanceType=OneSix\nManagedPack=false\nname={display_name}\n"
+    );
+    if let Some(key) = icon_key {
+        cfg.push_str(&format!("iconKey={key}\n"));
+    }
+    std::fs::write(dir.join("instance.cfg"), cfg)?;
     std::fs::write(
         dir.join("mmc-pack.json"),
         serde_json::to_string_pretty(&serde_json::json!({
@@ -73,7 +80,6 @@ pub fn create_mmc_instance(
         }))
         .expect("json"),
     )?;
-    set_prism_icon(data_dir, &dir, &slug, icon_path);
 
     Ok(GameTarget {
         launcher: kind,
@@ -95,32 +101,29 @@ fn prism_component_uid(loader: LoaderKind) -> &'static str {
     }
 }
 
-/// Иконка инстанса: копия в `<data>/icons/<slug>.png` + `iconKey` в cfg.
+/// Иконка инстанса: копия в `<data>/icons/<slug>.png`, возвращает ключ для
+/// `iconKey` (cfg пишет вызыватель — одним проходом, см. выше).
 /// Вход любой (WebP с сайта, JPEG из архива) — конвертер доводит до PNG.
-/// Best-effort: любая неудача молча пропускается, без предупреждений.
-fn set_prism_icon(data_dir: &Path, instance_dir: &Path, slug: &str, icon_path: Option<&Path>) {
-    let src = match icon_path {
-        Some(p) => p,
-        None => return,
-    };
-    let png = match crate::services::icon::ensure_png(src) {
-        Some(p) => p,
-        None => return,
-    };
+/// Кладём атомарно (временный файл + rename): вотчер лаунчера на недописанном
+/// PNG срабатывает вхолостую без повторной попытки. Best-effort: любая
+/// неудача молча пропускается, без предупреждений.
+fn set_prism_icon(data_dir: &Path, slug: &str, icon_path: Option<&Path>) -> Option<String> {
+    let src = icon_path?;
+    let png = crate::services::icon::ensure_png(src)?;
     let icons = data_dir.join("icons");
-    if std::fs::create_dir_all(&icons).is_err() {
-        return;
-    }
-    if std::fs::copy(&png, icons.join(format!("{slug}.png"))).is_err() {
-        return;
-    }
-    let cfg_path = instance_dir.join("instance.cfg");
-    if let Ok(mut cfg) = std::fs::read_to_string(&cfg_path) {
-        if !cfg.contains("iconKey=") {
-            cfg.push_str(&format!("iconKey={slug}\n"));
-            let _ = std::fs::write(&cfg_path, cfg);
-        }
-    }
+    std::fs::create_dir_all(&icons).ok()?;
+    let dest = icons.join(format!("{slug}.png"));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = icons.join(format!("{slug}.png.part-{}-{nanos}", std::process::id()));
+    std::fs::copy(&png, &tmp).ok()?;
+    // Rename поверх существующего на Windows не работает — сносим заранее
+    // (кейс переустановки поверх: ключ и slug те же, картинка новая).
+    let _ = std::fs::remove_file(&dest);
+    std::fs::rename(&tmp, &dest).ok()?;
+    Some(slug.to_string())
 }
 
 /// Свободный slug папки: занят → `<slug>_1`, `<slug>_2`...
@@ -337,6 +340,55 @@ mod tests {
         assert_eq!(back.width(), 2);
         let cfg = std::fs::read_to_string(target.path.join("instance.cfg")).expect("cfg");
         assert!(cfg.contains("iconKey=DeepMine"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn cfg_arrives_complete_with_icon_key() {
+        // Контракт против гонки с запущенным лаунчером: cfg пишется один раз
+        // и сразу содержит iconKey — промежуточного состояния без ключа нет.
+        let root = temp_root("icon-once");
+        let icon = fake_png(&root, "site-icon.png");
+        let target =
+            create_mmc_instance(LauncherKind::Multimc, &root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
+                .expect("create");
+        let cfg = std::fs::read_to_string(target.path.join("instance.cfg")).expect("cfg");
+        assert!(cfg.contains("name=DeepMine"));
+        assert!(cfg.contains("iconKey=DeepMine"));
+        assert_eq!(target.launcher, LauncherKind::Multimc);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn no_part_files_left_in_icons() {
+        let root = temp_root("icon-parts");
+        let icon = fake_png(&root, "site-icon.png");
+        create_mmc_instance(LauncherKind::Prism, &root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
+            .expect("create");
+        let left: Vec<String> = std::fs::read_dir(root.join("icons"))
+            .expect("read")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["DeepMine.png"]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reinstall_replaces_icon_for_same_slug() {
+        // Переустановка поверх (тот же slug): rename поверх занятого файла
+        // на Windows не работает — вторая иконка обязана лечь, а не потеряться.
+        let root = temp_root("icon-replace");
+        let first = fake_png(&root, "first.png");
+        let key = set_prism_icon(&root, "DeepMine", Some(&first)).expect("key");
+        assert_eq!(key, "DeepMine");
+        let img = image::RgbImage::from_pixel(1, 1, image::Rgb([200, 30, 30]));
+        let second = root.join("second.png");
+        img.save_with_format(&second, image::ImageFormat::Png).expect("png");
+        set_prism_icon(&root, "DeepMine", Some(&second)).expect("replace");
+        let back = image::open(root.join("icons").join("DeepMine.png")).expect("open");
+        let pixel = back.to_rgb8().get_pixel(0, 0).0;
+        assert_eq!(pixel, [200, 30, 30]);
         std::fs::remove_dir_all(&root).ok();
     }
 }
