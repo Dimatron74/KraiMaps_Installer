@@ -1,6 +1,6 @@
 /** TS-зеркала доменных типов Rust (src-tauri/src/domain). */
 
-export type LauncherKind = 'prism' | 'modrinth' | 'manual' | 'tlauncher';
+export type LauncherKind = 'prism' | 'pinecone' | 'polymc' | 'multimc' | 'modrinth' | 'manual' | 'tlauncher';
 export type LoaderKind = 'vanilla' | 'fabric' | 'forge' | 'quilt' | 'neoforge';
 
 export interface ModInfo {
@@ -131,6 +131,9 @@ export interface CmdError {
 
 export const LAUNCHER_NAMES: Record<LauncherKind, string> = {
   prism: 'Prism Launcher',
+  pinecone: 'Pinecone Launcher',
+  polymc: 'PolyMC',
+  multimc: 'MultiMC',
   modrinth: 'Modrinth App',
   manual: 'Папка вручную',
   tlauncher: 'TLauncher',

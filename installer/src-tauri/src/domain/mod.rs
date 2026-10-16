@@ -150,12 +150,17 @@ impl InstallError {
     }
 }
 
-/// Поддерживаемые лаунчеры. MVP: Prism + Modrinth (+ ручная папка для ваниллы),
+/// Поддерживаемые лаунчеры. Prism-семейство (Prism, Pinecone — бывший ElyPrism,
+/// PolyMC, MultiMC: общий формат `instances/*/instance.cfg + mmc-pack.json`
+/// и CLI `--launch <id>`) + Modrinth (+ ручная папка для ваниллы),
 /// плюс TLauncher (общий game dir без инстансов, версии в `versions/`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LauncherKind {
     Prism,
+    Pinecone,
+    Polymc,
+    Multimc,
     Modrinth,
     Manual,
     Tlauncher,
@@ -176,9 +181,9 @@ pub enum LoaderKind {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameTarget {
     pub launcher: LauncherKind,
-    /// Человекочитаемое имя (инстанс Prism, профиль Modrinth, имя папки).
+    /// Человекочитаемое имя (инстанс Prism-семейства, профиль Modrinth, имя папки).
     pub name: String,
-    /// Корень цели: у Prism — папка инстанса, у Modrinth — папка профиля.
+    /// Корень цели: у Prism-семейства — папка инстанса, у Modrinth — папка профиля.
     pub path: PathBuf,
     pub minecraft_version: String,
     pub loader: LoaderKind,
@@ -303,7 +308,7 @@ pub fn resolve_resourcepack_name(base: &str, kind: ResourcePackKind, exists: &dy
     }
 }
 
-/// Имя папки инстанса Prism / профиля Modrinth из названия карты.
+/// Имя папки инстанса (Prism-семейство) / профиля Modrinth из названия карты.
 /// Буквы (включая кириллицу — профили вроде «Хардкор 1.0» существуют
 /// вживую) / цифры / `-` / `_` как есть, пробелы и точки выкидываем
 /// (`"Tower of Doom"` → `"TowerofDoom"`). Пустой результат → `"Map"`,
@@ -464,6 +469,22 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&LauncherKind::Tlauncher).expect("json"),
             "\"tlauncher\""
+        );
+    }
+
+    #[test]
+    fn mmc_family_kinds_use_lowercase_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&LauncherKind::Pinecone).expect("json"),
+            "\"pinecone\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LauncherKind::Polymc).expect("json"),
+            "\"polymc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LauncherKind::Multimc).expect("json"),
+            "\"multimc\""
         );
     }
 

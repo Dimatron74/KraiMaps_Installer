@@ -1,20 +1,23 @@
-//! Молчаливое создание инстанса Prism (§6.1 дизайн-дока, рецепт спайка 2).
+//! Молчаливое создание инстанса Prism-семейства (§6.1 дизайн-дока, рецепт спайка 2).
 //!
-//! - `instances/<Slug>/` (конфликт → `_1`, `_2`...);
+//! Prism, Pinecone (бывший ElyPrism), PolyMC и MultiMC делят формат:
+//!   `instances/<Slug>/` (конфликт → `_1`, `_2`...);
 //! - `instance.cfg`: `ConfigVersion=1.3`, `name`, `InstanceType=OneSix`,
-//!   `ManagedPack=false` (иначе Prism сочтёт инстанс управляемым паком);
+//!   `ManagedPack=false` (иначе лаунчер сочтёт инстанс управляемым паком);
 //! - `mmc-pack.json`: `formatVersion: 1`, компоненты `net.minecraft`
-//!   (+ загрузчик). Jar и библиотеки Prism докачивает сам при запуске.
+//!   (+ загрузчик). Jar и библиотеки лаунчер докачивает сам при запуске.
 //! - `minecraft/saves/` создаём мы при деплое мира.
 
 use crate::domain::{sanitize_display_name, slugify, GameTarget, InstallError, LauncherKind, LoaderKind};
 use std::path::Path;
 
-/// Создаёт инстанс Prism. `loader_version` — точная версия (см. `versions`).
-/// `icon_path` — файл иконки из `prepare_instance_icon`; ставим только PNG
-/// (`icons/<slug>.png` + `iconKey`, механизм спеки): конвертера без image-
-/// зависимости нет, не-PNG молча пропускаем, а не ломаем инстанс.
-pub fn create_prism_instance(
+/// Создаёт инстанс любого лаунчера Prism-семейства (формат общий, см. шапку).
+/// `loader_version` — точная версия (см. `versions`). `icon_path` — файл
+/// иконки из `prepare_instance_icon`; ставим только PNG (`icons/<slug>.png`
+/// + `iconKey`, механизм спеки): конвертера без image-зависимости нет,
+/// не-PNG молча пропускаем, а не ломаем инстанс.
+pub fn create_mmc_instance(
+    kind: LauncherKind,
     data_dir: &Path,
     display_name: &str,
     mc_version: &str,
@@ -30,7 +33,7 @@ pub fn create_prism_instance(
     let dir = instances.join(&slug);
 
     // Защита в глубину: диапазон ("[40,)") или мусор вместо точной версии
-    // роняет обновление инстанса в Prism — такие значения не пишем никогда.
+    // роняет обновление инстанса в лаунчере — такие значения не пишем никогда.
     if loader != LoaderKind::Vanilla {
         match loader_version {
             Some(v) if crate::services::versions::is_exact_version(v) => {}
@@ -73,7 +76,7 @@ pub fn create_prism_instance(
     set_prism_icon(data_dir, &dir, &slug, icon_path);
 
     Ok(GameTarget {
-        launcher: LauncherKind::Prism,
+        launcher: kind,
         name: display_name.to_string(),
         path: dir,
         minecraft_version: mc_version.to_string(),
@@ -146,9 +149,25 @@ pub fn prism_launch_args(instance_id: &str, world: Option<&str>) -> Vec<String> 
     args
 }
 
-/// Запуск игры через Prism. Возвращает команду для «Подробнее».
-pub fn launch_prism(exe: &Path, instance_id: &str, world: Option<&str>) -> Result<String, InstallError> {
-    let args = prism_launch_args(instance_id, world);
+/// Аргументы запуска Prism-семейства (чистая функция — тестируется без сайд-эффектов).
+/// `--launch <id>` понимают все; `--world <мир>` — только Prism и Pinecone
+/// (свежий форк Prism): в CLI PolyMC/MultiMC этот флаг не документирован,
+/// чужой флаг может уронить запуск, поэтому его опускаем.
+pub fn mmc_launch_args(kind: LauncherKind, instance_id: &str, world: Option<&str>) -> Vec<String> {
+    match kind {
+        LauncherKind::Prism | LauncherKind::Pinecone => prism_launch_args(instance_id, world),
+        _ => vec!["--launch".to_string(), instance_id.to_string()],
+    }
+}
+
+/// Запуск игры через лаунчер Prism-семейства. Возвращает команду для «Подробнее».
+pub fn launch_mmc(
+    exe: &Path,
+    kind: LauncherKind,
+    instance_id: &str,
+    world: Option<&str>,
+) -> Result<String, InstallError> {
+    let args = mmc_launch_args(kind, instance_id, world);
     std::process::Command::new(exe)
         .args(&args)
         .spawn()
@@ -168,7 +187,7 @@ mod tests {
     #[test]
     fn creates_vanilla_instance_with_recipe_files() {
         let root = temp_root("vanilla");
-        let target = create_prism_instance(&root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, None)
+        let target = create_mmc_instance(LauncherKind::Prism, &root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, None)
             .expect("create");
         assert_eq!(target.name, "DeepMine");
         assert!(target.path.join("instance.cfg").is_file());
@@ -186,7 +205,8 @@ mod tests {
             .collect();
         assert_eq!(uids, ["net.minecraft"]);
         // Инстанс виден детекту.
-        let found = crate::services::detect::enumerate_prism_targets(&root);
+        let found =
+            crate::services::detect::enumerate_mmc_targets(&root, LauncherKind::Prism);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].minecraft_version, "1.21.11");
         std::fs::remove_dir_all(&root).ok();
@@ -196,7 +216,8 @@ mod tests {
     fn modded_instance_gets_loader_component_and_unique_slug() {
         let root = temp_root("modded");
         std::fs::create_dir_all(root.join("instances").join("TowerofDoom")).expect("taken");
-        let target = create_prism_instance(
+        let target = create_mmc_instance(
+            LauncherKind::Prism,
             &root,
             "Tower of Doom",
             "1.18.2",
@@ -228,6 +249,44 @@ mod tests {
         assert_eq!(prism_launch_args("DeepMine", None), ["--launch", "DeepMine"]);
     }
 
+    #[test]
+    fn mmc_family_launch_args_match_documented_cli() {
+        // Prism и Pinecone (свежий форк) — с автозаходом в мир.
+        assert_eq!(
+            mmc_launch_args(LauncherKind::Pinecone, "DeepMine", Some("DeepMine")),
+            ["--launch", "DeepMine", "--world", "DeepMine"]
+        );
+        // PolyMC/MultiMC флаг --world не документируют — только --launch.
+        for kind in [LauncherKind::Polymc, LauncherKind::Multimc] {
+            assert_eq!(
+                mmc_launch_args(kind, "DeepMine", Some("DeepMine")),
+                ["--launch", "DeepMine"]
+            );
+        }
+    }
+
+    #[test]
+    fn mmc_create_marks_target_with_family_kind() {
+        let root = temp_root("mmc-kind");
+        let target = create_mmc_instance(
+            LauncherKind::Polymc,
+            &root,
+            "DeepMine",
+            "1.21.11",
+            LoaderKind::Vanilla,
+            None,
+            None,
+        )
+        .expect("create");
+        assert_eq!(target.launcher, LauncherKind::Polymc);
+        assert!(target.path.join("instance.cfg").is_file());
+        assert!(target.path.join("mmc-pack.json").is_file());
+        let found = crate::services::detect::enumerate_mmc_targets(&root, LauncherKind::Polymc);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].launcher, LauncherKind::Polymc);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     fn fake_png(dir: &Path, name: &str) -> PathBuf {
         // Настоящий PNG 1x1 через энкодер (ручные байты могут не декодироваться).
         let img = image::RgbImage::from_pixel(1, 1, image::Rgb([70, 130, 180]));
@@ -241,7 +300,7 @@ mod tests {
         let root = temp_root("icon");
         let icon = fake_png(&root, "site-icon.png");
         let target =
-            create_prism_instance(&root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
+            create_mmc_instance(LauncherKind::Prism, &root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
                 .expect("create");
         assert!(root.join("icons").join("DeepMine.png").is_file());
         let cfg = std::fs::read_to_string(target.path.join("instance.cfg")).expect("cfg");
@@ -254,7 +313,7 @@ mod tests {
         let root = temp_root("icon-skip");
         let icon = fake_png(&root, "site-icon.webp");
         let target =
-            create_prism_instance(&root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
+            create_mmc_instance(LauncherKind::Prism, &root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
                 .expect("create");
         assert!(!root.join("icons").join("DeepMine.png").exists());
         let cfg = std::fs::read_to_string(target.path.join("instance.cfg")).expect("cfg");
@@ -269,7 +328,7 @@ mod tests {
         let icon = root.join("site-icon.jpg");
         img.save_with_format(&icon, image::ImageFormat::Jpeg).expect("jpg");
         let target =
-            create_prism_instance(&root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
+            create_mmc_instance(LauncherKind::Prism, &root, "DeepMine", "1.21.11", LoaderKind::Vanilla, None, Some(&icon))
                 .expect("create");
         let linked = root.join("icons").join("DeepMine.png");
         assert!(linked.is_file());

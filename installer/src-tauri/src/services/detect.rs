@@ -32,12 +32,15 @@ pub fn detect_launchers(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> De
         .any(|p| p.kind == LauncherKind::Modrinth);
 
     let mut launchers: Vec<LauncherInfo> = Vec::new();
-    launchers.extend(detect_prism(manual_roots, known_roots, &processes));
+    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &PRISM));
+    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &PINECONE));
+    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &POLYMC));
+    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &MULTIMC));
     launchers.extend(detect_modrinth(manual_roots, known_roots, &processes));
     launchers.extend(detect_tlauncher(manual_roots, known_roots));
 
     for root in manual_roots {
-        if is_prism_data_dir(root) || is_modrinth_data_dir(root) {
+        if is_any_mmc_data_dir(root) || is_modrinth_data_dir(root) {
             continue; // уже покрыты выше
         }
         if crate::adapters::tlauncher::is_tlauncher_data_dir(root) {
@@ -70,35 +73,107 @@ struct DataRoot {
     portable: bool,
 }
 
-/// Сбор корней Prism: портативки рядом с каждым найденным exe (слой processes/
-/// реестр/известные/PATH/ярлыки/запомненные/ручные) + стандартный корень.
-/// Одинаковые корни схлопываются — разные остаются разными карточками.
-fn detect_prism(
+/// Параметры одного лаунчера Prism-семейства: формат инстансов
+/// (`instances/*/instance.cfg + mmc-pack.json`) и CLI (`--launch <id>`)
+/// общие, имена exe/конфигов/папок данных — разные.
+#[derive(Clone, Copy)]
+struct MmcFamily {
+    kind: LauncherKind,
+    /// Префиксы имён exe в нижнем регистре: совпадение по `starts_with`.
+    exe_prefixes: &'static [&'static str],
+    /// Файлы-маркеры корня данных (помимо `instances/`).
+    cfg_markers: &'static [&'static str],
+    /// Папки данных в `%APPDATA%` (Windows) / `data_dir` (Linux).
+    /// Пусто — штатных путей нет, только портативка (как у MultiMC).
+    data_dirs: &'static [&'static str],
+    display: &'static str,
+}
+
+const PRISM: MmcFamily = MmcFamily {
+    kind: LauncherKind::Prism,
+    exe_prefixes: &["prismlauncher"],
+    cfg_markers: &["prismlauncher.cfg"],
+    data_dirs: &["PrismLauncher"],
+    display: "Prism Launcher",
+};
+
+// Одна карточка «Pinecone Launcher»: бинарь до сих пор называется
+// `elyprismlauncher` (см. `Launcher_APP_BINARY_NAME` в их CMakeLists),
+// данные — `%APPDATA%\ElyPrismLauncher`; `pinecone*` — задел на будущее
+// переименование после ребренда из ElyPrism.
+const PINECONE: MmcFamily = MmcFamily {
+    kind: LauncherKind::Pinecone,
+    exe_prefixes: &["elyprismlauncher", "pineconemc", "pinecone"],
+    cfg_markers: &["elyprismlauncher.cfg", "pineconemc.cfg"],
+    data_dirs: &["ElyPrismLauncher", "PineconeMC"],
+    display: "Pinecone Launcher",
+};
+
+const POLYMC: MmcFamily = MmcFamily {
+    kind: LauncherKind::Polymc,
+    exe_prefixes: &["polymc"],
+    cfg_markers: &["polymc.cfg"],
+    data_dirs: &["PolyMC"],
+    display: "PolyMC",
+};
+
+// Штатного установщика нет (только portable): `data_dirs` проверяем всё
+// равно — O(1) и задел, если появится неportable-вариант.
+const MULTIMC: MmcFamily = MmcFamily {
+    kind: LauncherKind::Multimc,
+    exe_prefixes: &["multimc"],
+    cfg_markers: &["multimc.cfg"],
+    data_dirs: &["MultiMC"],
+    display: "MultiMC",
+};
+
+fn mmc_family(kind: LauncherKind) -> &'static MmcFamily {
+    match kind {
+        LauncherKind::Prism => &PRISM,
+        LauncherKind::Pinecone => &PINECONE,
+        LauncherKind::Polymc => &POLYMC,
+        LauncherKind::Multimc => &MULTIMC,
+        LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher => {
+            panic!("not an MMC-family launcher")
+        }
+    }
+}
+
+/// Сбор корней Prism-семейства: портативки рядом с каждым найденным exe
+/// (слой processes/реестр/известные/PATH/ярлыки/запомненные/ручные) +
+/// стандартный корень. Одинаковые корни схлопываются — разные остаются
+/// разными карточками.
+fn detect_mmc(
     manual_roots: &[PathBuf],
     known_roots: &[PathBuf],
     processes: &[RunningLauncher],
+    fam: &'static MmcFamily,
 ) -> Vec<LauncherInfo> {
     let mut exes: Vec<PathBuf> = Vec::new();
-    exes.extend(manual_roots.iter().filter(|p| is_prism_exe(p)).cloned());
-    exes.extend(known_roots.iter().filter(|p| is_prism_exe(p)).cloned());
+    exes.extend(manual_roots.iter().filter(|p| is_mmc_exe(p, fam)).cloned());
+    exes.extend(known_roots.iter().filter(|p| is_mmc_exe(p, fam)).cloned());
     exes.extend(
         processes
             .iter()
-            .filter(|p| p.kind == LauncherKind::Prism)
+            .filter(|p| p.kind == fam.kind)
             .map(|p| p.exe.clone()),
     );
-    if let Some(exe) = exe_from_protocol() {
-        if is_prism_exe(&exe) {
-            exes.push(exe);
+    // Реестр протоколов разбираем только у Prism: у Modrinth/TLauncher этого
+    // слоя тоже нет, форкам отдельные схемы не гарантированы.
+    if fam.kind == LauncherKind::Prism {
+        if let Some(exe) = exe_from_protocol() {
+            if is_mmc_exe(&exe, fam) {
+                exes.push(exe);
+            }
         }
     }
-    exes.extend(known_prism_exe());
-    exes.extend(start_menu_exes().into_iter().filter(|p| is_prism_exe(p)));
-    exes.extend(exe_from_path_search());
+    exes.extend(known_mmc_exe(fam));
+    exes.extend(start_menu_exes().into_iter().filter(|p| is_mmc_exe(p, fam)));
+    exes.extend(exes_from_path_search(fam));
 
     let mut roots: Vec<DataRoot> = Vec::new();
     for exe in &exes {
-        if let Some(dir) = data_root_next_to_exe(exe, LauncherKind::Prism) {
+        if let Some(dir) = data_root_next_to_exe(exe, fam.kind) {
             roots.push(DataRoot {
                 exe: Some(exe.clone()),
                 dir,
@@ -106,7 +181,7 @@ fn detect_prism(
             });
         }
     }
-    if let Some(dir) = known_prism_data_root() {
+    if let Some(dir) = known_mmc_data_root(fam) {
         let exe = exes.into_iter().next();
         roots.push(DataRoot {
             exe,
@@ -115,7 +190,7 @@ fn detect_prism(
         });
     }
     for root in manual_roots.iter().chain(known_roots.iter()) {
-        if is_prism_data_dir(root) {
+        if is_mmc_data_dir(root, fam) && mmc_claim(root, fam.kind) {
             roots.push(DataRoot {
                 exe: None,
                 dir: root.clone(),
@@ -127,14 +202,14 @@ fn detect_prism(
     dedup_roots(roots)
         .into_iter()
         .map(|r| LauncherInfo {
-            kind: LauncherKind::Prism,
+            kind: fam.kind,
             display_name: if r.portable {
-                "Prism Launcher (портативный)".to_string()
+                format!("{} (портативный)", fam.display)
             } else {
-                "Prism Launcher".to_string()
+                fam.display.to_string()
             },
             exe_path: r.exe,
-            targets: enumerate_prism_targets(&r.dir),
+            targets: enumerate_mmc_targets(&r.dir, fam.kind),
             data_dir: r.dir,
             portable: r.portable,
         })
@@ -343,16 +418,18 @@ pub(crate) fn running_launcher_processes() -> Vec<RunningLauncher> {
     let mut out = Vec::new();
     for proc in sys.processes().values() {
         let name = proc.name().to_string_lossy().to_lowercase();
-        let kind = if name == "prismlauncher.exe" || name == "prismlauncher" {
-            Some(LauncherKind::Prism)
-        } else if name == "modrinth app.exe"
-            || name == "modrinthapp.exe"
-            || name == "modrinth-app"
-        {
-            Some(LauncherKind::Modrinth)
-        } else {
-            None
-        };
+        let stem = name.strip_suffix(".exe").unwrap_or(&name);
+        let kind = [&PRISM, &PINECONE, &POLYMC, &MULTIMC]
+            .into_iter()
+            .find(|fam| fam.exe_prefixes.iter().any(|p| stem == *p))
+            .map(|fam| fam.kind)
+            .or_else(|| {
+                if name == "modrinth app.exe" || name == "modrinthapp.exe" || name == "modrinth-app" {
+                    Some(LauncherKind::Modrinth)
+                } else {
+                    None
+                }
+            });
         if let Some(kind) = kind {
             if let Some(exe) = proc.exe().map(|p| p.to_path_buf()) {
                 out.push(RunningLauncher { kind, exe });
@@ -437,30 +514,62 @@ fn env_dir(var: &str, sub: &str) -> Option<PathBuf> {
     std::env::var_os(var).map(|base| Path::new(&base).join(sub))
 }
 
-fn known_prism_exe() -> Vec<PathBuf> {
+fn known_mmc_exe(fam: &MmcFamily) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
     {
-        for c in [
-            env_dir("LOCALAPPDATA", r"Programs\PrismLauncher\prismlauncher.exe"),
-            env_dir("ProgramFiles", r"PrismLauncher\prismlauncher.exe"),
-            env_dir("ProgramFiles(x86)", r"PrismLauncher\prismlauncher.exe"),
-            env_dir("USERPROFILE", r"scoop\apps\prismlauncher\current\prismlauncher.exe"),
-        ] {
-            out.extend(c);
+        match fam.kind {
+            LauncherKind::Prism => {
+                for c in [
+                    env_dir("LOCALAPPDATA", r"Programs\PrismLauncher\prismlauncher.exe"),
+                    env_dir("ProgramFiles", r"PrismLauncher\prismlauncher.exe"),
+                    env_dir("ProgramFiles(x86)", r"PrismLauncher\prismlauncher.exe"),
+                    env_dir("USERPROFILE", r"scoop\apps\prismlauncher\current\prismlauncher.exe"),
+                ] {
+                    out.extend(c);
+                }
+            }
+            LauncherKind::Pinecone => {
+                for c in [
+                    env_dir(
+                        "LOCALAPPDATA",
+                        r"Programs\ElyPrismLauncher\elyprismlauncher.exe",
+                    ),
+                    env_dir("ProgramFiles", r"ElyPrismLauncher\elyprismlauncher.exe"),
+                    env_dir("LOCALAPPDATA", r"Programs\PineconeMC\pineconemc.exe"),
+                ] {
+                    out.extend(c);
+                }
+            }
+            LauncherKind::Polymc => {
+                for c in [
+                    env_dir("LOCALAPPDATA", r"Programs\PolyMC\polymc.exe"),
+                    env_dir("ProgramFiles", r"PolyMC\polymc.exe"),
+                ] {
+                    out.extend(c);
+                }
+            }
+            // У MultiMC штатного установщика нет — только портативка, её ловят
+            // процессы/ярлыки/PATH/ручные корни.
+            LauncherKind::Multimc => {}
+            LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher => {}
         }
     }
     #[cfg(not(windows))]
     {
-        for c in [
-            Some(PathBuf::from("/usr/bin/prismlauncher")),
-            Some(PathBuf::from("/usr/local/bin/prismlauncher")),
-            dirs::home_dir().map(|h| h.join(".local/bin/prismlauncher")),
-            dirs::home_dir().map(|h| {
-                h.join("Applications/prismlauncher/prismlauncher")
-            }),
-        ] {
-            out.extend(c);
+        for prefix in fam.exe_prefixes {
+            for c in [
+                Some(PathBuf::from(format!("/usr/bin/{prefix}"))),
+                Some(PathBuf::from(format!("/usr/local/bin/{prefix}"))),
+                dirs::home_dir().map(|h| h.join(format!(".local/bin/{prefix}"))),
+            ] {
+                out.extend(c);
+            }
+        }
+        if fam.kind == LauncherKind::Prism {
+            out.extend(
+                dirs::home_dir().map(|h| h.join("Applications/prismlauncher/prismlauncher")),
+            );
         }
     }
     out.into_iter().filter(|p| p.is_file()).collect()
@@ -475,23 +584,46 @@ fn known_modrinth_exe() -> Vec<PathBuf> {
     out.into_iter().filter(|p| p.is_file()).collect()
 }
 
-fn known_prism_data_root() -> Option<PathBuf> {
+fn known_mmc_data_root(fam: &MmcFamily) -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        env_dir("APPDATA", "PrismLauncher").filter(|p| is_prism_data_dir(p))
+        if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            for dir in fam.data_dirs {
+                let c = appdata.join(dir);
+                if is_mmc_data_dir(&c, fam) {
+                    return Some(c);
+                }
+            }
+        }
+        None
     }
     #[cfg(not(windows))]
     {
-        dirs::data_dir()
-            .map(|d| d.join("PrismLauncher"))
-            .filter(|p| is_prism_data_dir(p))
-            .or_else(|| {
-                dirs::home_dir()
-                    .map(|h| {
-                        h.join(".var/app/org.prismlauncher.PrismLauncher/data/PrismLauncher")
-                    })
-                    .filter(|p| is_prism_data_dir(p))
-            })
+        for dir in fam.data_dirs {
+            if let Some(c) = dirs::data_dir()
+                .map(|d| d.join(dir))
+                .filter(|p| is_mmc_data_dir(p, fam))
+            {
+                return Some(c);
+            }
+        }
+        // Flatpak: известен только у Prism и PolyMC.
+        let flatpak: Option<&str> = match fam.kind {
+            LauncherKind::Prism => Some("org.prismlauncher.PrismLauncher"),
+            LauncherKind::Polymc => Some("org.polymc.PolyMC"),
+            _ => None,
+        };
+        if let Some(id) = flatpak {
+            if let Some(c) = dirs::home_dir()
+                .map(|h| {
+                    h.join(format!(".var/app/{id}/data/{}", fam.data_dirs[0]))
+                })
+                .filter(|p| is_mmc_data_dir(p, fam))
+            {
+                return Some(c);
+            }
+        }
+        None
     }
 }
 
@@ -511,24 +643,21 @@ fn known_modrinth_data_root() -> Option<PathBuf> {
 /// Портативка: данные рядом с exe в приоритете над стандартным корнем.
 /// Проверяем маркерами нужного лаунчера, имя exe уже проверено вызывателем.
 fn data_root_next_to_exe(exe: &Path, kind: LauncherKind) -> Option<PathBuf> {
-    let dir = exe.parent()?;
-    let is_data = match kind {
-        LauncherKind::Prism => is_prism_data_dir(dir),
+    let is_data = |dir: &Path| match kind {
+        LauncherKind::Prism | LauncherKind::Pinecone | LauncherKind::Polymc | LauncherKind::Multimc => {
+            is_mmc_data_dir(dir, mmc_family(kind))
+        }
         LauncherKind::Modrinth => is_modrinth_data_dir(dir),
         // Ручная папка и TLauncher разбираются отдельно (см. ниже).
         LauncherKind::Manual | LauncherKind::Tlauncher => false,
     };
-    if is_data {
+    let dir = exe.parent()?;
+    if is_data(dir) {
         return Some(dir.to_path_buf());
     }
     // Сама папка exe может быть подпапкой портативки — один уровень вверх.
     if let Some(parent) = dir.parent() {
-        let is_parent_data = match kind {
-            LauncherKind::Prism => is_prism_data_dir(parent),
-            LauncherKind::Modrinth => is_modrinth_data_dir(parent),
-            LauncherKind::Manual | LauncherKind::Tlauncher => false,
-        };
-        if is_parent_data {
+        if is_data(parent) {
             return Some(parent.to_path_buf());
         }
     }
@@ -666,29 +795,32 @@ fn lnk_target(path: &Path) -> Option<PathBuf> {
 }
 
 /// Поиск exe по `PATH` (перехватывает нестандартные установки).
-fn exe_from_path_search() -> Option<PathBuf> {
-    let names: &[&str] = &[
-        #[cfg(windows)]
-        "prismlauncher.exe",
-        #[cfg(not(windows))]
-        "prismlauncher",
-    ];
-    let path_var = std::env::var_os("PATH")?;
+fn exes_from_path_search(fam: &MmcFamily) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    let ext = ".exe";
+    #[cfg(not(windows))]
+    let ext = "";
+    let mut out = Vec::new();
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return out;
+    };
     for dir in std::env::split_paths(&path_var) {
-        for name in names {
-            let c = dir.join(name);
-            if c.is_file() {
-                return Some(c);
+        for prefix in fam.exe_prefixes {
+            let c = dir.join(format!("{prefix}{ext}"));
+            if c.is_file() && is_mmc_exe(&c, fam) {
+                out.push(c);
             }
         }
     }
-    None
+    out
 }
 
-fn is_prism_exe(p: &Path) -> bool {
+fn is_mmc_exe(p: &Path, fam: &MmcFamily) -> bool {
     p.is_file()
-        && p.file_name()
-            .is_some_and(|n| n.to_string_lossy().to_lowercase().starts_with("prismlauncher"))
+        && p.file_name().is_some_and(|n| {
+            let lower = n.to_string_lossy().to_lowercase();
+            fam.exe_prefixes.iter().any(|prefix| lower.starts_with(prefix))
+        })
 }
 
 fn is_modrinth_exe(p: &Path) -> bool {
@@ -698,10 +830,37 @@ fn is_modrinth_exe(p: &Path) -> bool {
         })
 }
 
-/// Корень данных Prism: есть `instances/` (инстансы появятся позже — тоже ок,
-/// главное что это именно данные Prism, а не случайная папка).
-fn is_prism_data_dir(p: &Path) -> bool {
-    p.is_dir() && (p.join("instances").is_dir() || p.join("prismlauncher.cfg").is_file())
+/// Корень данных Prism-семейства: есть `instances/` (инстансы появятся позже —
+/// тоже ок, главное что это именно данные нужного лаунчера, а не случайная
+/// папка) либо его cfg (`prismlauncher.cfg`, `polymc.cfg`, ...).
+fn is_mmc_data_dir(p: &Path, fam: &MmcFamily) -> bool {
+    p.is_dir()
+        && (p.join("instances").is_dir()
+            || fam.cfg_markers.iter().any(|m| p.join(m).is_file()))
+}
+
+fn is_any_mmc_data_dir(p: &Path) -> bool {
+    [&PRISM, &PINECONE, &POLYMC, &MULTIMC]
+        .into_iter()
+        .any(|fam| is_mmc_data_dir(p, fam))
+}
+
+/// Владелец корня по cfg-маркеру (`polymc.cfg` → PolyMC...). Один корень —
+/// одна семья: иначе ручной корень с общим `instances/` давал бы четыре
+/// карточки-дубля. Bare-каталог (только `instances/`, без cfg) забирает
+/// Prism — историческое поведение детекта.
+fn mmc_owner(root: &Path) -> Option<LauncherKind> {
+    [&PRISM, &PINECONE, &POLYMC, &MULTIMC]
+        .into_iter()
+        .find(|fam| fam.cfg_markers.iter().any(|m| root.join(m).is_file()))
+        .map(|fam| fam.kind)
+}
+
+fn mmc_claim(root: &Path, kind: LauncherKind) -> bool {
+    match mmc_owner(root) {
+        Some(owner) => owner == kind,
+        None => kind == LauncherKind::Prism,
+    }
 }
 
 /// Корень данных Modrinth App: профили или база.
@@ -709,10 +868,10 @@ fn is_modrinth_data_dir(p: &Path) -> bool {
     p.is_dir() && (p.join("profiles").is_dir() || p.join("app.db").is_file())
 }
 
-/// Читает инстансы Prism: `instances/*/instance.cfg + mmc-pack.json`.
+/// Читает инстансы Prism-семейства: `instances/*/instance.cfg + mmc-pack.json`.
 /// Инстансы без `net.minecraft` в компонентах пропускаем — по ним нельзя
 /// построить строгий фильтр версия+загрузчик, гадать запрещено.
-pub fn enumerate_prism_targets(data_dir: &Path) -> Vec<GameTarget> {
+pub fn enumerate_mmc_targets(data_dir: &Path, kind: LauncherKind) -> Vec<GameTarget> {
     let mut out = Vec::new();
     let instances = data_dir.join("instances");
     let entries = std::fs::read_dir(&instances).map(|r| r.collect::<Vec<_>>());
@@ -725,14 +884,14 @@ pub fn enumerate_prism_targets(data_dir: &Path) -> Vec<GameTarget> {
         .collect();
     dirs.sort();
     for dir in dirs {
-        if let Some(target) = read_prism_instance(&dir) {
+        if let Some(target) = read_mmc_instance(&dir, kind) {
             out.push(target);
         }
     }
     out
 }
 
-fn read_prism_instance(dir: &Path) -> Option<GameTarget> {
+fn read_mmc_instance(dir: &Path, kind: LauncherKind) -> Option<GameTarget> {
     let cfg = std::fs::read_to_string(dir.join("instance.cfg")).ok()?;
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     for line in cfg.lines() {
@@ -776,7 +935,7 @@ fn read_prism_instance(dir: &Path) -> Option<GameTarget> {
         }
     }
     Some(GameTarget {
-        launcher: LauncherKind::Prism,
+        launcher: kind,
         name: values
             .remove("name")
             .filter(|n| !n.is_empty())
@@ -966,7 +1125,7 @@ mod tests {
         write(&broken.join("instance.cfg"), &fabric_instance_cfg("Broken"));
         write(&broken.join("mmc-pack.json"), r#"{"formatVersion": 1, "components": []}"#);
 
-        let targets = enumerate_prism_targets(&root);
+        let targets = enumerate_mmc_targets(&root, LauncherKind::Prism);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].name, "Alpha");
         assert_eq!(targets[0].minecraft_version, "1.21.11");
@@ -984,6 +1143,98 @@ mod tests {
         let found =
             data_root_next_to_exe(&exe, LauncherKind::Prism).expect("portable root");
         assert_eq!(found, root);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mmc_targets_carry_family_kind() {
+        let root = temp_root("mmc-kind");
+        let inst = root.join("instances").join("Alpha");
+        write(&inst.join("instance.cfg"), &fabric_instance_cfg("Alpha"));
+        write(
+            &inst.join("mmc-pack.json"),
+            &mmc_pack("1.21.11", Some(("net.fabricmc.fabric-loader", "0.19.5"))),
+        );
+        let targets = enumerate_mmc_targets(&root, LauncherKind::Pinecone);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].launcher, LauncherKind::Pinecone);
+        assert_eq!(targets[0].minecraft_version, "1.21.11");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mmc_exe_prefixes_do_not_cross_match() {
+        let root = temp_root("mmc-exe");
+        for (name, fam, others) in [
+            ("elyprismlauncher.exe", &PINECONE, [&PRISM, &POLYMC, &MULTIMC]),
+            ("polymc.exe", &POLYMC, [&PRISM, &PINECONE, &MULTIMC]),
+            ("MultiMC.exe", &MULTIMC, [&PRISM, &PINECONE, &POLYMC]),
+            ("prismlauncher.exe", &PRISM, [&PINECONE, &POLYMC, &MULTIMC]),
+        ] {
+            let exe = root.join(name);
+            std::fs::write(&exe, b"fake").expect("exe");
+            assert!(is_mmc_exe(&exe, fam), "{name}");
+            for other in others {
+                assert!(!is_mmc_exe(&exe, other), "{name} vs {}", other.display);
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn mmc_data_dirs_match_by_instances_or_cfg() {
+        let root = temp_root("mmc-data");
+        // Портативный MultiMC: exe + instances/ + собственный cfg рядом.
+        let portable = root.join("portable");
+        std::fs::create_dir_all(&portable).expect("portable dir");
+        let exe = portable.join("MultiMC.exe");
+        std::fs::write(&exe, b"fake").expect("exe");
+        std::fs::create_dir_all(portable.join("instances")).expect("instances");
+        write(&portable.join("multimc.cfg"), "InstanceDir=instances\n");
+        assert!(is_mmc_data_dir(&portable, &MULTIMC));
+        assert!(is_mmc_data_dir(&portable, &POLYMC)); // маркер общий, владелец один
+        assert!(mmc_claim(&portable, LauncherKind::Multimc));
+        assert!(!mmc_claim(&portable, LauncherKind::Polymc));
+        assert_eq!(
+            data_root_next_to_exe(&exe, LauncherKind::Multimc).expect("root"),
+            portable
+        );
+        // Установленный PolyMC: корень только с cfg, без instances/.
+        let installed = root.join("PolyMC");
+        write(&installed.join("polymc.cfg"), "InstanceDir=instances\n");
+        assert!(is_mmc_data_dir(&installed, &POLYMC));
+        assert!(mmc_claim(&installed, LauncherKind::Polymc));
+        assert!(!mmc_claim(&installed, LauncherKind::Prism));
+        // Bare-каталог (только instances/) — исторически Prism, без дублей.
+        let bare = root.join("bare");
+        std::fs::create_dir_all(bare.join("instances")).expect("bare instances");
+        assert!(mmc_claim(&bare, LauncherKind::Prism));
+        assert!(!mmc_claim(&bare, LauncherKind::Pinecone));
+        // Чужой каталог корнем не считается.
+        assert!(!is_any_mmc_data_dir(&root));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn manual_mmc_root_yields_single_card() {
+        let root = temp_root("mmc-single");
+        let inst = root.join("instances").join("Alpha");
+        write(&inst.join("instance.cfg"), &fabric_instance_cfg("Alpha"));
+        write(
+            &inst.join("mmc-pack.json"),
+            &mmc_pack("1.21.11", Some(("net.fabricmc.fabric-loader", "0.19.5"))),
+        );
+        write(&root.join("polymc.cfg"), "InstanceDir=instances\n");
+        let detection = detect_launchers(&[(*root).clone()], &[]);
+        let ours: Vec<_> = detection
+            .launchers
+            .iter()
+            .filter(|l| l.data_dir == *root)
+            .collect();
+        assert_eq!(ours.len(), 1);
+        assert_eq!(ours[0].kind, LauncherKind::Polymc);
+        assert_eq!(ours[0].targets.len(), 1);
+        assert_eq!(ours[0].targets[0].launcher, LauncherKind::Polymc);
         std::fs::remove_dir_all(&root).ok();
     }
 

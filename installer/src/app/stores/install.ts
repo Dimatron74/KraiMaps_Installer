@@ -710,9 +710,14 @@ export const useInstallStore = defineStore('install', {
       this.busy = true;
       try {
         const exe = launcher.exe_path;
-        if (target.launcher === 'prism') {
+        if (
+          target.launcher === 'prism' ||
+          target.launcher === 'pinecone' ||
+          target.launcher === 'polymc' ||
+          target.launcher === 'multimc'
+        ) {
           await api.launchGame({
-            launcher: 'prism',
+            launcher: target.launcher,
             exe,
             instanceId: target.path,
             world: this.report.world_dir_name,

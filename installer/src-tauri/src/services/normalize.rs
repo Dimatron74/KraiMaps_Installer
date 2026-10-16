@@ -1018,8 +1018,9 @@ fn parse_quilt_json(
     }))
 }
 
-/// Корень игры в инстансе Prism: `minecraft/`, затем legacy-варианты (§6.7 ТЗ
-/// с поправкой спайка: корень — `minecraft/`, не `.minecraft/`).
+/// Корень игры в инстансе Prism-семейства: `minecraft/`, затем legacy-варианты
+/// (§6.7 ТЗ с поправкой спайка: корень — `minecraft/`, не `.minecraft/`).
+/// Layout общий для Prism, Pinecone, PolyMC и MultiMC.
 pub fn prism_game_root(instance_dir: &Path) -> PathBuf {
     for candidate in ["minecraft", ".minecraft", ""] {
         let dir = if candidate.is_empty() {

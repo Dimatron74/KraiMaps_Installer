@@ -104,7 +104,11 @@ pub async fn create_instance(
     let data_dir = PathBuf::from(data_dir);
     let icon_path = icon_path.map(PathBuf::from);
     tauri::async_runtime::spawn_blocking(move || match launcher {
-        LauncherKind::Prism => prism::create_prism_instance(
+        LauncherKind::Prism
+        | LauncherKind::Pinecone
+        | LauncherKind::Polymc
+        | LauncherKind::Multimc => prism::create_mmc_instance(
+            launcher,
             &data_dir,
             &name,
             &mc_version,
@@ -138,7 +142,10 @@ pub async fn deploy_pack(
 ) -> Cmd<deploy::DeployReport> {
     // Корень игры зависит от лаунчера; Modrinth перепроверяем на запись.
     let game_root = match target.launcher {
-        LauncherKind::Prism => normalize::prism_game_root(&target.path),
+        LauncherKind::Prism
+        | LauncherKind::Pinecone
+        | LauncherKind::Polymc
+        | LauncherKind::Multimc => normalize::prism_game_root(&target.path),
         // Modrinth: профиль; TLauncher и ручная папка: сам game dir.
         // Деплой пишет только файлы профиля (saves/mods/config), базу не
         // трогает — запущенное приложение не мешает, запрета нет.
@@ -286,7 +293,10 @@ fn deploy_into(
 /// Упрощение без костылей: wipe требуется, только если `mods/` непуста.
 fn is_fresh_target(target: &GameTarget) -> bool {
     let game_root = match target.launcher {
-        LauncherKind::Prism => normalize::prism_game_root(&target.path),
+        LauncherKind::Prism
+        | LauncherKind::Pinecone
+        | LauncherKind::Polymc
+        | LauncherKind::Multimc => normalize::prism_game_root(&target.path),
         _ => target.path.clone(),
     };
     let mods = game_root.join("mods");
@@ -342,7 +352,10 @@ pub fn discard_temp_files(paths: Vec<String>) -> usize {
 pub async fn suggest_world_name(target: GameTarget, world_name: String) -> Cmd<String> {
     tauri::async_runtime::spawn_blocking(move || {
         let game_root = match target.launcher {
-            LauncherKind::Prism => normalize::prism_game_root(&target.path),
+            LauncherKind::Prism
+            | LauncherKind::Pinecone
+            | LauncherKind::Polymc
+            | LauncherKind::Multimc => normalize::prism_game_root(&target.path),
             LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher => {
                 target.path.clone()
             }
@@ -356,9 +369,10 @@ pub async fn suggest_world_name(target: GameTarget, world_name: String) -> Cmd<S
     .await?
 }
 
-/// Кнопка «Играть»: Prism — прямой запуск в мир, Modrinth — открыть
-/// приложение на профиле, ручная папка — открыть папку в проводнике.
-/// Возвращает команду для «Подробнее».
+/// Кнопка «Играть»: Prism-семейство — прямой запуск в мир (у PolyMC/MultiMC
+/// флаг `--world` опускается самим адаптером, см. `mmc_launch_args`),
+/// Modrinth — открыть приложение на профиле, ручная папка — открыть папку
+/// в проводнике. Возвращает команду для «Подробнее».
 #[tauri::command]
 pub async fn launch_game(
     launcher: LauncherKind,
@@ -368,12 +382,15 @@ pub async fn launch_game(
     folder: Option<String>,
 ) -> Cmd<String> {
     tauri::async_runtime::spawn_blocking(move || match launcher {
-        LauncherKind::Prism => {
+        LauncherKind::Prism
+        | LauncherKind::Pinecone
+        | LauncherKind::Polymc
+        | LauncherKind::Multimc => {
             let exe = exe
                 .map(PathBuf::from)
                 .ok_or(InstallError::NoLauncher)?;
             let id = instance_dir_name(&instance_id);
-            prism::launch_prism(&exe, &id, world.as_deref())
+            prism::launch_mmc(&exe, launcher, &id, world.as_deref())
         }
         LauncherKind::Modrinth => {
             let exe = exe
