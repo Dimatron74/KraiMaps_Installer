@@ -1,0 +1,50 @@
+# Node
+node_modules/
+dist/
+*.local
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Opencode
+.opencode/
+AGENTS.md
+
+# Tauri
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OpenCode local cache and secrets
+.opencode/.cache/
+.opencode/logs/
+.opencode/secrets/
+
+# Tauri update signing: приватный ключ НИКОГДА не в git
+# (утрата/утечка = поддельные обновления или смерть апдейтов).
+# Публичный *.key.pub — можно и нужно коммитить, он для проверки.
+# Бэкап приватного ключа + пароль CI — отдельно, вне репозитория.
+installer/.keys/*.key
+
+# Kraimaps
+kraimaps-site/
+maps/
+
+# Private product docs: stay on disk for reference, never enter git
+# (the public repo must not contain the internal spec).
+docs/

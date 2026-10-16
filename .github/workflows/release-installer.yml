@@ -1,0 +1,391 @@
+# ========================================
+# MapInstaller — релиз установщика
+# ========================================
+#
+# Запуск: push тега `v*` (напр. `v0.2.0`) или вручную (workflow_dispatch).
+# Два job'а (только Windows/NSIS — единственный bundle-target):
+#   build (windows): версии → `tauri build` с подписью → S3 immutable-файлы
+#     версии (`installer/<version>/`, кэш год) → tar-артефакт для publish.
+#   publish (ubuntu): указатель latest (кэш год!) → purge CDN → зеркало
+#     GitHub Release (только теги).
+#
+# Кэширование как у архивов карт на сайте: всё immutable — год
+# (`public, max-age=31536000, immutable`, та же строка, что
+# `CACHE_CONTROL_IMMUTABLE` сайта). Указатель `installer/latest.json`
+# тоже годовой — свежесть держит ОБЯЗАТЕЛЬНЫЙ purge перед перезаписью.
+# Порядок в publish осознанный: сначала заливка указателя, потом purge
+# (CDN сбросит кэш и подтянет новое с origin при первом запросе).
+# Purge распространяется до 15 минут (платформа) — это норма, не ошибка.
+# Если purge упал — job падает ГРОМКО до создания Release: состояние
+# «S3 новое + CDN старое на год» чинится только ручным purge (команда
+# печатается в лог шага).
+#
+# Права: build `contents:read`; publish `contents:write` (GitHub Release).
+# Sigstore-аттестации осознанно НЕ встроены (TODO(public): добавить шаг
+# аттестации после открытия репозитория); следующий уровень доверия для
+# Windows — платный Authenticode (OV) против SmartScreen (решение владельца,
+# CI-часть — один шаг `signtool`).
+#
+# Секреты (Settings → Secrets → Actions):
+#   TAURI_SIGNING_PRIVATE_KEY  — приватный ключ подписи (весь файл .key)
+#   INSTALLER_S3_ACCESS_KEY_ID / INSTALLER_S3_SECRET_ACCESS_KEY
+#   INSTALLER_YC_SA_KEY        — JSON авторизованного ключа сервис-аккаунта
+#     Yandex Cloud с ролью `cdn.editor` (только для purge; создаёт владелец
+#     облака = команда сайта). Официальный экшен yc-actions/yc-cdn-cache
+#     сам меняет его на короткоживущий IAM-токен.
+# Переменные (Settings → Variables → Actions):
+#   INSTALLER_S3_ENDPOINT_URL  — напр. https://storage.yandexcloud.net
+#   INSTALLER_S3_BUCKET        — напр. kraimaps-files
+#   INSTALLER_FILES_BASE_URL   — публичная база, напр. https://files.kraimaps.ru/installer
+#   INSTALLER_CDN_RESOURCE_ID  — ID CDN-ресурса files.kraimaps.ru (для purge;
+#     доступ по ID глобальный, folder-id purge'у не нужен — только при поиске
+#     ресурса по имени; где взять ID: консоль → Cloud CDN → ресурс, или
+#     `yc cdn resource list`).
+#   INSTALLER_MIN_SUPPORTED_VERSION — опционально; пусто = hard-block нет.
+#      Поднимается ОТДЕЛЬНО от релиза (практика раскатки: сначала выходит
+#      версия как soft для всех, позже минимум поднимают — старые уходят в hard).
+
+name: Release installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      min_supported:
+        description: 'min_supported_version (пусто = hard-block нет)'
+        required: false
+        default: ''
+      notes:
+        description: 'Changelog релиза'
+        required: false
+        default: ''
+      force:
+        description: 'Разрешить перезапись указателя latest старшей версией младшей (откат)'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: installer-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # Лимит: зависшая сборка падает, а не жжёт минуты раннера (релизный
+    # windows-билд идёт ~5 минут, запас — на обновления тулчейна/кэша).
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      min_supported: ${{ steps.ver.outputs.min_supported }}
+      exe_name: ${{ steps.art.outputs.exe_name }}
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+      AWS_ACCESS_KEY_ID: ${{ secrets.INSTALLER_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.INSTALLER_S3_SECRET_ACCESS_KEY }}
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      # Экшены запинены по SHA (release-пайплайн владеет подписью обновлений:
+      # цена компрометации — поддельные сборки у всех клиентов).
+      # Мажоры — актуальные на 2026-10 (action-gh-release v2 EOL + Node 20
+      # deprecated — только v3; action-setup v6 — официальная поддержка pnpm 12).
+      # Dependabot для SHA-пинов: настроить отдельно.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Теги нужны целиком (а не только коммит): сообщение аннотированного
+          # тега — источник changelog для точечных релизов (см. Make manifests).
+          fetch-tags: true
+
+      - name: Derive version
+        id: ver
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(python -c "import json; print(json.load(open('installer/package.json', encoding='utf-8'))['version'])")"
+          fi
+          MIN="${{ inputs.min_supported }}"
+          if [[ -z "$MIN" ]]; then MIN="${{ vars.INSTALLER_MIN_SUPPORTED_VERSION }}"; fi
+          # Источник changelog: ручной ввод (dispatch) либо сообщение
+          # АННОТИРОВАННОГО тега (`git tag -a vX.Y.Z -m "..."`). Лёгкие теги
+          # и пустой ввод = без changelog, клиент покажет нейтральный текст.
+          # Многострочность — через delimiter-синтаксис outputs (простой
+          # echo с переносами сломал бы файл).
+          NOTES="${{ inputs.notes }}"
+          if [[ -z "$NOTES" && "${{ github.ref_type }}" == "tag" ]]; then
+            NOTES="$(git tag -l --format='%(contents)' "${{ github.ref_name }}")"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "min_supported=$MIN" >> "$GITHUB_OUTPUT"
+          {
+            echo "notes<<EOFNOTES"
+            echo "$NOTES"
+            echo "EOFNOTES"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION (min: ${MIN:-<none>})"
+
+      - name: Version consistency (Cargo/tauri.conf/package.json)
+        run: |
+          python - <<'EOF'
+          import json, re, sys, tomllib
+          want = "${{ steps.ver.outputs.version }}"
+          # encoding='utf-8' обязателен: дефолт Windows-раннера — cp1252,
+          # а в tauri.conf.json кириллица (заголовок окна) → иначе
+          # UnicodeDecodeError (см. первый упавший прогон v0.1.2).
+          cargo = tomllib.load(open("installer/src-tauri/Cargo.toml", "rb"))["package"]["version"]
+          conf = json.load(open("installer/src-tauri/tauri.conf.json", encoding="utf-8"))["version"]
+          pkg = json.load(open("installer/package.json", encoding="utf-8"))["version"]
+          bad = {k: v for k, v in {"Cargo.toml": cargo, "tauri.conf.json": conf, "package.json": pkg}.items() if v != want}
+          if bad:
+              print(f"version mismatch vs {want}: {bad}")
+              sys.exit(1)
+          print(f"versions ok: {want}")
+          EOF
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          # Версия из installer/package.json → packageManager (единственный
+          # источник; action-setup читает package_json_file, дефолт — КОРНЕВОЙ
+          # package.json, которого в монорепо нет). v6 обязателен: только он
+          # официально поддерживает pnpm 12 и Node 24 runtime.
+          package_json_file: installer/package.json
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: installer/pnpm-lock.yaml
+
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+
+      # Кэш cargo (registry + артефакты зависимостей). Без него КАЖДЫЙ релиз
+      # компилирует ~400 крейтов с нуля (~15-25 мин: холодный раннер + жирный
+      # LTO-профиль + C-гиганты aws-lc-sys/ring/zstd-sys). С ним — только
+      # изменившееся (минуты). workspaces обязателен: Cargo-проект не в корне,
+      # а в installer/src-tauri (дефолт ". -> target" его бы не нашёл).
+      # Эффект — со СЛЕДУЮЩЕГО релиза: текущий прогон кэша ещё не содержит.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          workspaces: installer/src-tauri
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+        working-directory: installer
+
+      - name: Tauri build (signed NSIS)
+        run: pnpm tauri build
+        working-directory: installer
+
+      - name: Locate artifacts
+        id: art
+        run: |
+          mapfile -t exes < <(ls installer/src-tauri/target/release/bundle/nsis/*-setup.exe)
+          if [[ "${#exes[@]}" -ne 1 ]]; then
+            echo "expected exactly one *-setup.exe, found: ${exes[*]:-<none>}"
+            exit 1
+          fi
+          echo "exe=${exes[0]}" >> "$GITHUB_OUTPUT"
+          echo "exe_name=$(basename "${exes[0]}")" >> "$GITHUB_OUTPUT"
+          test -f "${exes[0]}.sig" || { echo "missing signature ${exes[0]}.sig"; exit 1; }
+          echo "exe=${exes[0]} sig=${exes[0]}.sig"
+
+      - name: Make manifests
+        run: |
+          FILE="${{ steps.art.outputs.exe_name }}"
+          python installer/scripts/make-latest-json.py \
+            --version "${{ steps.ver.outputs.version }}" \
+            --min-supported "${{ steps.ver.outputs.min_supported }}" \
+            --notes "${{ steps.ver.outputs.notes }}" \
+            --windows-exe "${{ steps.art.outputs.exe }}" \
+            --windows-url "${{ vars.INSTALLER_FILES_BASE_URL }}/${{ steps.ver.outputs.version }}/$FILE" \
+            --out-dir release-manifests
+
+      - name: Guard latest pointer (no silent downgrade)
+        # Указатель installer/latest.json двигается только вперёд: повторный
+        # запуск на старой версии или гонка двух тегов не должны откатывать
+        # клиентов (даунгрейд и клиент, и плагин отклонят, но будет путаница).
+        # Обход — только явный `force: true` в ручном запуске.
+        run: |
+          python - <<'EOF'
+          import json, os, re, sys, urllib.request
+          new = os.environ["NEW_VERSION"]
+          force = os.environ["FORCE"] == "true"
+          base = "${{ vars.INSTALLER_FILES_BASE_URL }}".rstrip("/")
+          try:
+              with urllib.request.urlopen(base + "/latest.json", timeout=20) as r:
+                  cur = json.load(r).get("version", "")
+          except Exception as e:
+              print(f"current pointer unreadable ({e}); first release, proceeding")
+              sys.exit(0)
+          def key(v):
+              v = v.strip().lstrip("vV")
+              m = re.match(r"^(\d+)\.(\d+)\.(\d+)", v)
+              return tuple(int(x) for x in m.groups()) if m else (-1,)
+          if cur and key(cur) > key(new) and not force:
+              print(f"refusing downgrade of latest pointer: current {cur} > new {new} (use force to override)")
+              sys.exit(1)
+          print(f"pointer guard ok: current={cur or '<none>'} new={new}")
+          EOF
+        env:
+          NEW_VERSION: ${{ steps.ver.outputs.version }}
+          FORCE: ${{ inputs.force }}
+
+      - name: Upload immutable version files to S3
+        # Кэш год: файлы версии неизменяемы (новый релиз = новый префикс),
+        # та же строка, что CACHE_CONTROL_IMMUTABLE сайта.
+        run: |
+          EP="${{ vars.INSTALLER_S3_ENDPOINT_URL }}"
+          B="${{ vars.INSTALLER_S3_BUCKET }}"
+          V="${{ steps.ver.outputs.version }}"
+          EXE="${{ steps.art.outputs.exe }}"
+          CC="public, max-age=31536000, immutable"
+          aws --endpoint-url "$EP" s3 cp "$EXE" "s3://$B/installer/$V/" --acl public-read --cache-control "$CC"
+          aws --endpoint-url "$EP" s3 cp "$EXE.sig" "s3://$B/installer/$V/" --acl public-read --cache-control "$CC"
+          aws --endpoint-url "$EP" s3 cp release-manifests/latest.json "s3://$B/installer/$V/latest.json" --acl public-read --content-type application/json --cache-control "$CC"
+          aws --endpoint-url "$EP" s3 cp release-manifests/updater.json "s3://$B/installer/$V/updater.json" --acl public-read --content-type application/json --cache-control "$CC"
+
+      - name: Pack artifact for publish job
+        run: |
+          EXE="${{ steps.art.outputs.exe }}"
+          tar -czf installer-release.tgz "$EXE" "$EXE.sig" release-manifests/latest.json release-manifests/updater.json
+          tar -tzf installer-release.tgz
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: installer-release
+          path: installer-release.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Лимит с запасом на распространение purge (платформа даёт до ~15 минут).
+    timeout-minutes: 30
+    # contents:write — создание/обновление GitHub Release тега.
+    permissions:
+      contents: write
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.INSTALLER_S3_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.INSTALLER_S3_SECRET_ACCESS_KEY }}
+      AWS_EC2_METADATA_DISABLED: 'true'
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: installer-release
+
+      - name: Unpack
+        run: |
+          tar -xzf installer-release.tgz
+          EXE="$(find . -name '*-setup.exe' | head -1)"
+          test -n "$EXE" || { echo "no *-setup.exe in bundle"; exit 1; }
+          echo "EXE=$EXE" >> "$GITHUB_ENV"
+
+      - name: Upload latest pointer to S3 (year cache)
+        # Годовой кэш указателя безопасен, только потому что следующий шаг
+        # (purge) обязателен: свежесть держит инвалидация, а не TTL.
+        run: |
+          EP="${{ vars.INSTALLER_S3_ENDPOINT_URL }}"
+          B="${{ vars.INSTALLER_S3_BUCKET }}"
+          CC="public, max-age=31536000, immutable"
+          aws --endpoint-url "$EP" s3 cp release-manifests/latest.json "s3://$B/installer/latest.json" --acl public-read --content-type application/json --cache-control "$CC"
+          aws --endpoint-url "$EP" s3 cp release-manifests/updater.json "s3://$B/installer/updater.json" --acl public-read --content-type application/json --cache-control "$CC"
+
+      - name: Purge CDN pointer cache
+        # Официальный экшен Yandex (yc-actions/yc-cdn-cache): селективный
+        # purge двух указателей. Пустой cdn-paths значил бы ПОЛНЫЙ purge
+        # всего ресурса files.kraimaps.ru (включая кэш карт!) — поэтому
+        # пути указаны явно всегда. Доступ по resource-id глобальный,
+        # folder-id для purge не нужен (нужен только при поиске по имени).
+        # Распространение — до 15 минут (платформа), это норма.
+        # Падение шага = ГРОМКО: состояние «S3 новое + CDN старое на год»
+        # чинится только ручным purge:
+        #   yc cdn cache purge --resource-id <id> \
+        #     --path /installer/latest.json*,/installer/updater.json*
+        uses: yc-actions/yc-cdn-cache@a220813dd1c9488313f6ae6776f48e145a016cd8 # v1
+        with:
+          yc-sa-json-credentials: ${{ secrets.INSTALLER_YC_SA_KEY }}
+          cdn-resource-id: ${{ vars.INSTALLER_CDN_RESOURCE_ID }}
+          cdn-paths: |
+            /installer/latest.json*
+            /installer/updater.json*
+
+      # --- Публичное зеркало + доказуемое происхождение (только теги) ---
+      # Ручной dispatch релиз не создаёт: ему не к чему его привязывать
+      # (релиз GitHub всегда висит на теге), артефакты уходят только на S3.
+      # Обычным пользователям нужен только .exe; подпись и суммы лежат
+      # отдельно в *-provenance.zip, чтобы лишние файлы не путали.
+
+      - name: Provenance pack (sig + sums)
+        if: github.ref_type == 'tag'
+        run: |
+          python3 - <<'EOF'
+          import hashlib, os, zipfile
+          exe = os.environ["EXE"]
+          d = os.path.dirname(exe)
+          f = os.path.basename(exe)
+          def sha256(p):
+              h = hashlib.sha256()
+              with open(p, "rb") as fh:
+                  for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                      h.update(chunk)
+              return h.hexdigest()
+          sums = f"{sha256(exe)}  {f}\n{sha256(exe + '.sig')}  {f}.sig\n"
+          with open("SHA256SUMS.txt", "w", encoding="utf-8", newline="\n") as fh:
+              fh.write(sums)
+          version = os.environ["VERSION"]
+          zname = f"installer-{version}-provenance.zip"
+          with zipfile.ZipFile(zname, "w", zipfile.ZIP_DEFLATED) as z:
+              z.write(exe + ".sig", f + ".sig")
+              z.write("SHA256SUMS.txt", "SHA256SUMS.txt")
+          print(f"packed {zname}")
+          print(sums, end="")
+          EOF
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+
+      - name: GitHub Release (exe + provenance)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          files: |
+            ${{ env.EXE }}
+            installer-${{ needs.build.outputs.version }}-provenance.zip
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Установщик карт КрайКарт ${{ needs.build.outputs.version }}.
+
+            Обычным пользователям нужен только `.exe` ниже. Архив `*-provenance.zip` — для проверки (подпись сборки + SHA-256).
+
+            Этот релиз собран и опубликован автоматически (CI) из исходников коммита тега — файлы приложены роботом, а не загружены человеком:
+            - коммит: ${{ github.sha }}
+            - прогон сборки: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Как убедиться, что файл тот самый:
+            1. Сверь SHA-256 установщика с `SHA256SUMS.txt` из provenance-архива.
+            2. Основной канал обновлений — сайт (`/installer`), установщик сверяет подпись сборки встроенным ключом автоматически.
+            3. Вопросы — в issues репозитория.
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Установщик ${{ needs.build.outputs.version }} опубликован";
+            echo "";
+            echo "- latest: \`${{ vars.INSTALLER_FILES_BASE_URL }}/latest.json\` (кэш год, purge выполнен)";
+            echo "- min_supported: \`${{ needs.build.outputs.min_supported }}\` (пусто = hard-block нет)";
+            if [[ "${{ github.ref_type }}" == "tag" ]]; then
+              echo "- GitHub Release: \`${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}\` (exe + provenance-zip)";
+            fi;
+            echo "- Purge распространяется до ~15 минут — проверить сайт /installer/releases после паузы";
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 32">
+  <defs>
+    <linearGradient id="k-grad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7dd3fc"/>
+      <stop offset="100%" stop-color="#0ea5e9"/>
+    </linearGradient>
+  </defs>
+
+  <text x="11" y="24" text-anchor="middle"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+        font-size="24" font-weight="900" letter-spacing="-0.5"
+        fill="url(#k-grad)">К</text>
+
+  <text x="26" y="24" text-anchor="middle"
+        font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"
+        font-size="24" font-weight="900" letter-spacing="-0.5"
+        fill="#f1f5f9">К</text>
+
+  <rect x="17" y="22" width="4" height="4" rx="0.6" fill="#7dd3fc"/>
+</svg>

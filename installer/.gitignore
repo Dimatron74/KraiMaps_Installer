@@ -1,0 +1,43 @@
+# ================= Dependencies =================
+# Install with pnpm only (see packageManager in package.json).
+node_modules/
+
+# ================= Build outputs =================
+# Frontend bundle (vite) and Rust/Tauri artifacts. Rebuilt by CI / `pnpm build`.
+dist/
+src-tauri/target/
+src-tauri/gen/schemas/
+
+# ================= Env =================
+# Real secrets never enter git. Only .env.example is public.
+.env
+.env.*
+!.env.example
+
+# ================= Tauri updater signing =================
+# The private *.key NEVER enters git: loss/leak = forged updates or a dead
+# update channel. Backup the key + CI passphrase outside any repository.
+# The public *.key.pub MUST be committed: clients verify updates against it.
+.keys/*.key
+!.keys/*.key.pub
+
+# ================= Logs =================
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# ================= OS =================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ================= IDE =================
+# Local editor state is personal; share only recommended extensions.
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.iml
+
+# ================= Caches =================
+*.tsbuildinfo
+.vite/

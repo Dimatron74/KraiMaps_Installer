@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MapInstaller KraiMaps",
+  "version": "0.1.2",
+  "identifier": "com.kraimaps.installer",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Установщик карт - КрайКарт",
+        "width": 980,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": false,
+        "maximizable": false,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    }
+  },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["kraimaps"]
+      }
+    },
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI4QjMzMjhDNTQxNjkzNEEKUldSS2t4WlVqREt6dUNWcWN6aUJmT3FDRmt3ZDJjL0RUdUNIUHN3OXEvTG5hTDI2cjg3cExwaVQK",
+      "endpoints": [
+        "https://kraimaps.ru/api/v1/installer/updates?current={{current_version}}&target={{target}}&arch={{arch}}"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}
