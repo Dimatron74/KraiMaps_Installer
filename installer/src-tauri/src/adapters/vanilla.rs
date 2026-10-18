@@ -414,9 +414,29 @@ pub fn read_version_dir(dir: &Path) -> Option<VanillaVersion> {
     parse_version_json(&name, &json)
 }
 
+/// Помечена ли версия как недокачанная (см. [`INCOMPLETE_PREFIX`]).
+///
+/// Маркер ставится до любых записей при провижининге, поэтому такая версия не
+/// считается готовой: [`find_match`] её не находит и провижинит заново, и в
+/// [`enumerate_targets`] она не должна показываться как цель — иначе кнопка
+/// «подготовить версию» скроется, а чинить будет нечем. У ванильных версий
+/// маркера не бывает: их качает сам лаунчер, мы их не провижиним.
+fn version_incomplete(
+    data_dir: &Path,
+    mc: &str,
+    loader: LoaderKind,
+    loader_version: Option<&str>,
+) -> bool {
+    let Some(loader_version) = loader_version else {
+        return false;
+    };
+    incomplete_marker_path(data_dir, mc, loader, loader_version).exists()
+}
+
 /// Цели лаунчера: по одной на папку версии, `path` — `target_dir` (куда
 /// лаунчер положит `saves/`; у TLauncher и официального это корень игровых
-/// данных, у Legacy — подпапка выбранного режима). Детерминированный порядок.
+/// данных, у Legacy — подпапка выбранного режима). Недокачанные версии
+/// целями не считаются (см. [`version_incomplete`]). Детерминированный порядок.
 pub fn enumerate_targets(
     data_dir: &Path,
     target_dir: &Path,
@@ -437,6 +457,9 @@ pub fn enumerate_targets(
         let Some(v) = read_version_dir(&dir) else {
             continue;
         };
+        if version_incomplete(data_dir, &v.mc_version, v.loader, v.loader_version.as_deref()) {
+            continue;
+        }
         out.push(GameTarget {
             launcher: kind,
             name: v.dir_name,
@@ -1566,6 +1589,35 @@ mod tests {
         )
         .expect("marker");
         assert!(find_match(&root, "1.18.2", LoaderKind::Forge, "40.3.0").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Недокачанная версия не должна и появляться в списке целей: кнопка
+    /// «подготовить версию» тогда остаётся на месте и чинит версию, а не
+    /// исчезает, потому что «такая версия уже есть».
+    #[test]
+    fn incomplete_version_is_not_listed_as_target() {
+        let root = temp_root("incomplete-target");
+        let versions = root.join("versions");
+        let vdir = versions.join("1.18.2-forge-40.3.0");
+        std::fs::create_dir_all(&vdir).expect("vdir");
+        std::fs::write(
+            vdir.join("1.18.2-forge-40.3.0.json"),
+            r#"{"id": "1.18.2-forge-40.3.0",
+                "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+                "arguments": {"game": ["--fml.forgeVersion", "40.3.0"]},
+                "libraries": [{"name": "net.minecraftforge:forge:1.18.2-40.3.0"}]}"#,
+        )
+        .expect("json");
+        let targets = |root: &Path| enumerate_targets(root, root, LauncherKind::Legacy);
+        assert_eq!(targets(&root).len(), 1);
+
+        std::fs::write(
+            incomplete_marker_path(&root, "1.18.2", LoaderKind::Forge, "40.3.0"),
+            b"",
+        )
+        .expect("marker");
+        assert!(targets(&root).is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 

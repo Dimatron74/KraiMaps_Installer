@@ -494,7 +494,7 @@ pub async fn suggest_world_name(target: GameTarget, world_name: String) -> Cmd<S
             }
         };
         let saves = game_root.join("saves");
-        Ok(crate::domain::resolve_world_name(
+        Ok(crate::domain::resolve_unique_name(
             &world_name,
             &|n| saves.join(n).exists(),
         ))

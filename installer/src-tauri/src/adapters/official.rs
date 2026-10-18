@@ -254,9 +254,14 @@ fn encode_png_exact(img: &image::DynamicImage) -> Vec<u8> {
 /// Создание нашей установки: собственная папка игры под карту, свой id,
 /// своя иконка. Существующие установки пользователя не трогаем.
 ///
+/// Каждый вызов создаёт НОВУЮ установку. Молча переписывать прошлую нельзя:
+/// пользователь нажал «создать установку» и получил бы ту же папку, а мир
+/// ушёл бы в неё же — выглядело бы как «ничего не создалось». Занятое имя
+/// разрешает вызывающий ([`ensure_installation`]): «DeepMine 1.21.11» →
+/// «DeepMine 1.21.11_v2», и у него своя папка.
+///
 /// Поле `gameDir` — обязательное: без него лаунчер запускает установку в
-/// корне `.minecraft` и наша папка остаётся невидимой. Повторный вызов с тем
-/// же именем обновляет уже созданную нами установку, а не плодит дубли.
+/// корне `.minecraft` и наша папка остаётся невидимой.
 pub fn create_installation(
     data_dir: &Path,
     display_name: &str,
@@ -293,35 +298,12 @@ pub fn create_installation(
         .and_then(|p| p.as_object_mut())
         .ok_or_else(|| InstallError::ModrinthSchema("в profiles нет объекта".to_string()))?;
 
-    // Установка с тем же именем и той же папкой игры — это наша прошлая
-    // попытка для той же карты. Обновляем её, иначе каждая переустановка
-    // оставляла бы после себя ещё одну копию в списке лаунчера.
-    let existing = obj.iter().find_map(|(id, p)| {
-        (p.get("name").and_then(|v| v.as_str()) == Some(display_name)
-            && p.get("gameDir").and_then(|v| v.as_str()) == Some(game_dir_str.as_str()))
-        .then(|| id.clone())
-    });
-    let seed = match existing {
-        Some(id) => {
-            let old_created = obj[&id]["created"].clone();
-            let mut merged = profile;
-            // `created` при обновлении не меняем — это дата первой установки.
-            if !old_created.is_null() {
-                merged["created"] = old_created;
-            }
-            obj.insert(id.clone(), merged);
-            id
-        }
-        None => {
-            // 32 hex — формат id лаунчера; генерируем свободный.
-            let mut seed = uuid::Uuid::new_v4().simple().to_string();
-            while obj.contains_key(&seed) {
-                seed = uuid::Uuid::new_v4().simple().to_string();
-            }
-            obj.insert(seed.clone(), profile);
-            seed
-        }
-    };
+    // 32 hex — формат id лаунчера; генерируем свободный.
+    let mut seed = uuid::Uuid::new_v4().simple().to_string();
+    while obj.contains_key(&seed) {
+        seed = uuid::Uuid::new_v4().simple().to_string();
+    }
+    obj.insert(seed.clone(), profile);
     write_json(&profiles_path, &doc)?;
 
     Ok(Installation {
@@ -409,6 +391,23 @@ pub fn add_quick_play(
 }
 
 /// Подготовка версии и нашей установки под карту.
+/// Имя новой установки без конфликтов с уже существующими.
+///
+/// Занятое имя не мешает: установок у лаунчера сколько угодно, а папка игры
+/// выводится из имени, поэтому «DeepMine 1.21.11» → «DeepMine 1.21.11_v2» и
+/// у него своя папка. Регистр игнорируем: «DeepMine 1.21.11» и
+/// «deepmine 1.21.11» в списке лаунчера выглядят как дубль, а не как две
+/// разные установки.
+fn unique_installation_name(data_dir: &Path, base: &str) -> String {
+    let taken: Vec<String> = read_installations(data_dir)
+        .into_iter()
+        .map(|i| i.name)
+        .collect();
+    crate::domain::resolve_unique_name(base, &|n| {
+        taken.iter().any(|t| t.eq_ignore_ascii_case(n))
+    })
+}
+
 pub async fn ensure_installation(
     data_dir: &Path,
     display_name: &str,
@@ -443,7 +442,15 @@ pub async fn ensure_installation(
         }
     };
 
-    let inst = create_installation(data_dir, display_name, &version_dir_name, icon)?;
+    // У установок, в отличие от папок `versions/`, сколько угодно — лаунчер
+    // различает их по `gameDir`, а он выводится из имени. Поэтому занятое имя
+    // не мешает: получаем новую установку с суффиксом и своей папкой.
+    let inst = create_installation(
+        data_dir,
+        &unique_installation_name(data_dir, display_name),
+        &version_dir_name,
+        icon,
+    )?;
     let game_dir = inst.dir_in(data_dir);
     Ok(vanilla::EnsureResult {
         target: GameTarget {
@@ -680,18 +687,43 @@ mod tests {
     }
 
     #[test]
-    fn repeat_install_reuses_profile_instead_of_duplicating() {
+    fn repeat_install_gets_its_own_installation_and_folder() {
         let root = temp_root("repeat");
         let mc = make_data_dir(&root);
-        let first = create_installation(&mc, "Map", "1.21.11", None).expect("create");
-        let second = create_installation(&mc, "Map", "1.21.11", None).expect("recreate");
-        assert_eq!(first.id, second.id, "повторная установка не плодит копии");
-        assert_eq!(read_installations(&mc).len(), 2, "одна наша + одна исходная");
+        let first = create_installation(
+            &mc,
+            &unique_installation_name(&mc, "Map 1.21.11"),
+            "1.21.11",
+            None,
+        )
+        .expect("create");
+        let second = create_installation(
+            &mc,
+            &unique_installation_name(&mc, "Map 1.21.11"),
+            "1.21.11",
+            None,
+        )
+        .expect("recreate");
 
-        // `created` первой установки сохраняется, `lastVersionId` обновляется.
-        let doc = read_json(&mc.join(PROFILES_FILE)).expect("doc");
-        let ours = &doc["profiles"][&first.id];
-        assert_eq!(ours["name"], json!("Map"));
+        assert_ne!(first.id, second.id, "повторная установка — отдельная установка");
+        assert_eq!(first.name, "Map 1.21.11");
+        assert_eq!(second.name, "Map 1.21.11_v2");
+        assert_ne!(
+            first.dir_in(&mc),
+            second.dir_in(&mc),
+            "у каждой установки своя папка игры"
+        );
+        // Одна исходная из `make_data_dir` + две наши.
+        assert_eq!(read_installations(&mc).len(), 3);
+    }
+
+    /// Регистр не различает: в списке лаунчера такие имена выглядят дублем.
+    #[test]
+    fn taken_installation_name_ignores_case() {
+        let root = temp_root("case");
+        let mc = make_data_dir(&root);
+        create_installation(&mc, "Map 1.21.11", "1.21.11", None).expect("create");
+        assert_eq!(unique_installation_name(&mc, "map 1.21.11"), "map 1.21.11_v2");
     }
 
     #[test]

@@ -67,6 +67,29 @@ function isVersionLauncher(kind: LauncherKind): boolean {
   return VERSION_LAUNCHERS.includes(kind);
 }
 
+/**
+ * Точная версия загрузчика, на которую мы считаем.
+ *
+ * Резолв (`resolveLoaderVersion`) подставляет актуальную версию под версию
+ * игры; если он не удался, остаётся подсказка из манифеста/архива, а если её
+ * нет — `null`. `null` означает «не знаем», и всё, что зависит от точной версии
+ * (список подходящих целей, кнопка подготовки версии), обязано в этом случае
+ * **ничего не скрывать**: ложное «версия уже есть» хуже лишней кнопки.
+ */
+function effectiveLoaderVersion(state: {
+  pack: PackAnalysis | null;
+  loaderVersion: string | null;
+  siteMeta: SiteMeta | null;
+}): string | null {
+  const pack = state.pack;
+  if (!pack?.is_modded) return null;
+  const hint = state.siteMeta?.loaderVersion?.trim() || null;
+  return state.loaderVersion ?? hint ?? pack.loader_version_hint ?? null;
+}
+
+/** Ответ резолва версии загрузчика, пока он в полёте (см. `ensureLoaderVersion`). */
+let loaderVersionRequest: Promise<string | null> | null = null;
+
 /** Подсказка следующего шага по коду ошибки (человекочитаемо, без жаргона). */
 function hintFor(code: string, running: LauncherKind[], launcher: LauncherKind | null): string {
   const name = launcher ? LAUNCHER_NAMES[launcher] : null;
@@ -124,7 +147,11 @@ function actionFor(code: string): InstallError['action'] {
   return undefined;
 }
 
-function toInstallError(e: unknown, running: LauncherKind[], launcher: LauncherKind | null): InstallError {
+function toInstallError(
+  e: unknown,
+  running: LauncherKind[],
+  launcher: LauncherKind | null,
+): InstallError {
   const err = e as Partial<CmdError>;
   const code = typeof err.code === 'string' ? err.code : 'E_IO';
   return {
@@ -201,11 +228,93 @@ export const useInstallStore = defineStore('install', {
       const launcher = state.launcher;
       if (!pack || !launcher) return [];
       if (launcher.kind === 'manual') return pack.is_modded ? [] : launcher.targets;
+      const loaderVersion = effectiveLoaderVersion(state);
       return launcher.targets.filter((t) => {
         if (pack.world_version && t.minecraft_version !== pack.world_version) return false;
-        if (pack.is_modded && t.loader !== pack.loader) return false;
+        if (pack.is_modded) {
+          if (t.loader !== pack.loader) return false;
+          // Версия загрузчика решает не меньше типа: Fabric 0.16.9 не запустит
+          // карту, собранную под 0.17.1.
+          if (loaderVersion && (t.loader_version ?? null) !== loaderVersion) return false;
+        }
         return true;
       });
+    },
+
+    /**
+     * Версия, чью папку пришлось бы создавать заново, — если она уже есть.
+     *
+     * У Legacy и TLauncher версия это папка `versions/<Имя>/`, а папка на
+     * комбинацию (версия игры, загрузчик, версия загрузчика) ровно одна:
+     * «создать новый инстанс» там не создаёт ничего, а приводит в уже
+     * существующую папку. Значит кнопку на месте такой версии показывать
+     * незачем — правду пользователю говорит карточка в списке целей.
+     *
+     * Критерий тот же, что у бэкенд-`find_match`, поэтому расхождений между
+     * «кнопка скрыта» и «установка создаст новую папку» не будет. Недокачанные
+     * версии целями не считаются, так что сломанная версия не спрячет кнопку,
+     * которая её чинит.
+     */
+    takenVersionTarget(state): GameTarget | null {
+      const pack = state.pack;
+      const launcher = state.launcher;
+      if (!pack || !launcher) return null;
+      // У официального лаунчера установок сколько угодно: папка игры выводится
+      // из имени, поэтому кнопка «создать установку» создаёт новую всегда.
+      if (!isVersionLauncher(launcher.kind) || launcher.kind === 'official') return null;
+      const mc = pack.world_version;
+      if (!mc) return null;
+      const loaderVersion = effectiveLoaderVersion(state);
+      return (
+        launcher.targets.find(
+          (t) =>
+            t.minecraft_version === mc &&
+            t.loader === pack.loader &&
+            (t.loader_version ?? null) === loaderVersion,
+        ) ?? null
+      );
+    },
+
+    /** Подпись и пояснение кнопки «создать» для текущей пары лаунчер/карта. */
+    newTargetCta(state): { title: string; hint: string } | null {
+      const pack = state.pack;
+      const launcher = state.launcher;
+      if (!pack || !launcher || launcher.kind === 'manual') return null;
+      const mc = pack.world_version ?? '';
+      const mapName = state.siteTitle ?? pack.world_name;
+
+      if (launcher.kind === 'official') {
+        return {
+          title: `Создать установку «${mapName} ${mc}»`,
+          hint: 'Своя папка игры под карту — ваши установки и миры не пострадают. Таких установок можно сделать сколько угодно, поэтому занятое имя не мешает: получится DeepMine 1.21.11_v2.',
+        };
+      }
+      if (isVersionLauncher(launcher.kind)) {
+        if (!pack.is_modded) {
+          return launcher.kind === 'tlauncher'
+            ? {
+                title: 'Установить в TLauncher',
+                hint: 'У TLauncher одна папка игры для всех версий — карта встанет рядом с вашими мирами, а версию игры вы выберете в лаунчере.',
+              }
+            : {
+                title: `Установить версию «${mc}»`,
+                hint: 'Подготовим папку для миров и выберем версию в Legacy Launcher. Саму версию игры лаунчер скачает при первом запуске — это займёт несколько минут.',
+              };
+        }
+        const loaderVersion = effectiveLoaderVersion(state);
+        const version = `${mc} · ${LOADER_NAMES[pack.loader]}${loaderVersion ? ` ${loaderVersion}` : ''}`;
+        return {
+          title: `Подготовить «${version}»`,
+          hint:
+            launcher.kind === 'tlauncher'
+              ? 'Скачаем официальный установщик и подготовим версию с пометкой [KK] — ничего нажимать не нужно. У TLauncher папка mods/ общая для всех версий, поэтому моды карты заменят текущие (старые сохраним в бэкап).'
+              : 'Скачаем официальный установщик и подготовим версию с пометкой [KK] — ничего нажимать не нужно.',
+        };
+      }
+      return {
+        title: `Создать новый инстанс «${mapName}»`,
+        hint: 'Рекомендуется для модовых карт — ничего чужого не тронем.',
+      };
     },
 
     needsWipe(state): boolean {
@@ -300,11 +409,7 @@ export const useInstallStore = defineStore('install', {
     },
 
     fail(e: unknown, returnStep: Step) {
-      this.error = toInstallError(
-        e,
-        this.detection?.running ?? [],
-        this.launcher?.kind ?? null,
-      );
+      this.error = toInstallError(e, this.detection?.running ?? [], this.launcher?.kind ?? null);
       this.errorReturnStep = returnStep;
       this.step = 'error';
       this.busy = false;
@@ -469,9 +574,15 @@ export const useInstallStore = defineStore('install', {
       }
     },
 
-    selectLauncher(l: LauncherInfo) {      this.launcher = l;
+    selectLauncher(l: LauncherInfo) {
+      this.launcher = l;
       this.busy = false;
       this.statusLine = '';
+      // Экран цели показывает кнопку «подготовить версию» и подходящие версии,
+      // а обе вещи зависят от точной версии загрузчика — резолвим её заранее.
+      // Провал здесь не фатален: `createVersionTarget` повторит резолв и
+      // покажет ту же ошибку, что и раньше.
+      void this.ensureLoaderVersion().catch(() => {});
       const suitable = this.suitableTargets;
       if (suitable.length === 0) {
         // Не во что ставить — молча создаём новый (статус в прогрессе).
@@ -479,6 +590,37 @@ export const useInstallStore = defineStore('install', {
       } else {
         this.step = 'target';
       }
+    },
+
+    /**
+     * Точная версия загрузчика, резолвится один раз: результат нужен и экрану
+     * цели, и подготовке версии. Хранится в `loaderVersion` — там же живёт
+     * отметка «подобрана автоматически».
+     */
+    async ensureLoaderVersion(): Promise<string | null> {
+      const pack = this.pack;
+      if (!pack?.is_modded) return null;
+      const mc = pack.world_version;
+      if (!mc) return null;
+      if (this.loaderVersion) return this.loaderVersion;
+      // Запрос в полёте переиспользуем: выбрать лаунчер с авто-созданием цели
+      // и нажать кнопку можно не дожидаясь сети, а второй запрос вернул бы то
+      // же самое. Сбрасываем в любом исходе — после провала клик должен суметь
+      // повторить.
+      loaderVersionRequest ??= (async () => {
+        // Приоритет по спеке (D7): точная версия автора из манифеста проходит
+        // как есть (без сети); диапазон/отсутствие — хинт архива → meta-API.
+        // Хинт из архива может быть диапазоном ("[40,)") — бэкенд такой не
+        // примет и отрезолвит в последнюю версию.
+        const siteVersion = this.siteMeta?.loaderVersion?.trim() || null;
+        const baseHint = siteVersion ?? pack.loader_version_hint;
+        this.loaderVersion = await api.resolveLoaderVersion(pack.loader, mc, baseHint);
+        this.loaderVersionAuto = this.loaderVersion !== baseHint;
+        return this.loaderVersion;
+      })().finally(() => {
+        loaderVersionRequest = null;
+      });
+      return loaderVersionRequest;
     },
 
     /**
@@ -677,13 +819,7 @@ export const useInstallStore = defineStore('install', {
         this.progress = event.payload;
       });
       try {
-        const siteVersion = this.siteMeta?.loaderVersion?.trim() || null;
-        const baseHint = siteVersion ?? pack.loader_version_hint;
-        const loaderVersion = pack.is_modded
-          ? await api.resolveLoaderVersion(pack.loader, mc, baseHint ?? null)
-          : null;
-        this.loaderVersion = loaderVersion;
-        this.loaderVersionAuto = loaderVersion !== baseHint;
+        const loaderVersion = await this.ensureLoaderVersion();
         this.statusLine = pack.is_modded
           ? 'Ставим версию игры — это займёт несколько минут…'
           : 'Готовим установку…';
@@ -748,7 +884,10 @@ export const useInstallStore = defineStore('install', {
       if (!target || !pack) return;
       this.busy = true;
       try {
-        const suggested = await api.suggestWorldName(target, this.finalWorldName || pack.world_name);
+        const suggested = await api.suggestWorldName(
+          target,
+          this.finalWorldName || pack.world_name,
+        );
         this.suggestedWorldName = suggested;
         this.busy = false;
         if (suggested !== (this.finalWorldName || pack.world_name)) {
@@ -910,6 +1049,5 @@ export const useInstallStore = defineStore('install', {
       }
       this.busy = false;
     },
-
   },
 });

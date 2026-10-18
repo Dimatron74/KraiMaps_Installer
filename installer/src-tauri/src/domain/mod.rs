@@ -364,9 +364,11 @@ pub fn sanitize_display_name(raw: &str) -> String {
     }
 }
 
-/// Имя мира в `saves/` с учётом конфликта. Замена запрещена всегда: занятое имя
-/// даёт суффикс `_v2`, `_v3`... (`exists` проверяет наличие папки в цели).
-pub fn resolve_world_name(base: &str, exists: &dyn Fn(&str) -> bool) -> String {
+/// Имя папки с учётом конфликта. Замена запрещена всегда: занятое имя даёт
+/// суффикс `_v2`, `_v3`... Мир в `saves/` и установка официального лаунчера
+/// («DeepMine 1.21.11» → «DeepMine 1.21.11_v2») — одна и та же политика.
+/// `exists` проверяет наличие папки в цели.
+pub fn resolve_unique_name(base: &str, exists: &dyn Fn(&str) -> bool) -> String {
     if !exists(base) {
         return base.to_string();
     }
@@ -421,18 +423,18 @@ mod tests {
     }
 
     #[test]
-    fn world_conflict_appends_version_suffix() {
+    fn unique_conflict_appends_version_suffix() {
         let existing = ["DeepMine".to_string()];
         let exists = |n: &str| existing.iter().any(|e| e == n);
-        assert_eq!(resolve_world_name("DeepMine", &exists), "DeepMine_v2");
-        assert_eq!(resolve_world_name("Fresh", &exists), "Fresh");
+        assert_eq!(resolve_unique_name("DeepMine", &exists), "DeepMine_v2");
+        assert_eq!(resolve_unique_name("Fresh", &exists), "Fresh");
     }
 
     #[test]
-    fn world_conflict_increments_suffix() {
+    fn unique_conflict_increments_suffix() {
         let existing = ["DeepMine".to_string(), "DeepMine_v2".to_string()];
         let exists = |n: &str| existing.iter().any(|e| e == n);
-        assert_eq!(resolve_world_name("DeepMine", &exists), "DeepMine_v3");
+        assert_eq!(resolve_unique_name("DeepMine", &exists), "DeepMine_v3");
     }
 
     #[test]

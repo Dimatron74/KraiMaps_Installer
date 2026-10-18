@@ -494,6 +494,36 @@ pub fn launch_legacy(config: &LegacyConfig, version: &str) -> Result<String, Ins
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "живая проверка: печатает версии реального Legacy Launcher"]
+    fn live_dumps_legacy_version_slots() {
+        let roaming = PathBuf::from(std::env::var_os("APPDATA").expect("APPDATA"));
+        for dir in known_install_dirs(&roaming) {
+            let Some(cfg) = LegacyConfig::load(&dir) else {
+                continue;
+            };
+            println!("--- {}", dir.display());
+            for t in enumerate_targets(&cfg) {
+                println!(
+                    "  слот: mc={} loader={:?} loader_version={:?} dir={} target={}",
+                    t.minecraft_version,
+                    t.loader,
+                    t.loader_version,
+                    t.name,
+                    t.path.display()
+                );
+            }
+            // Все папки версий на диске — включая те, что целями не стали.
+            if let Ok(entries) = std::fs::read_dir(cfg.game_dir.join("versions")) {
+                for e in entries.flatten() {
+                    if e.path().is_dir() {
+                        println!("  папка: {}", e.file_name().to_string_lossy());
+                    }
+                }
+            }
+        }
+    }
+
     fn temp_root(tag: &str) -> crate::test_utils::TempDir {
         crate::test_utils::TempDir::new(&format!("mapinstaller-legacy-{tag}"))
     }

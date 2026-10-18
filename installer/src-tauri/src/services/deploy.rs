@@ -7,7 +7,7 @@
 //! - Мир пишется атомарно: `<Имя>.__install` → rename; замена запрещена.
 //! - Всё удалённое/заменённое — в `.kraimaps-backup/<дата>/`.
 
-use crate::domain::{resolve_world_name, InstallError, ResourcePackKind, ResourcePackSelection};
+use crate::domain::{resolve_unique_name, InstallError, ResourcePackKind, ResourcePackSelection};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -421,7 +421,7 @@ pub fn deploy_world(
     progress: Progress,
 ) -> Result<String, InstallError> {
     std::fs::create_dir_all(saves_dir)?;
-    let final_name = resolve_world_name(world_name, &|n| saves_dir.join(n).exists());
+    let final_name = resolve_unique_name(world_name, &|n| saves_dir.join(n).exists());
     let staging = saves_dir.join(format!("{final_name}.__install"));
     if staging.exists() {
         std::fs::remove_dir_all(&staging)?;
