@@ -135,6 +135,8 @@ export interface StageEvent {
   /** Сквозной прогресс всего деплоя в байтах (ставит бэкенд; у провижининга нет). */
   overall_done?: number | null;
   overall_total?: number | null;
+  /** Сырая строка лога установщика — только для раскрываемого «подробнее». */
+  detail?: string | null;
 }
 
 /** Ошибка команды: `{code, message, details}` (код E_* для «Подробнее»). */

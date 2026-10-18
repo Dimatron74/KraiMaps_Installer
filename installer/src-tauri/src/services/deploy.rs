@@ -31,6 +31,11 @@ pub struct StageEvent {
     pub overall_done: Option<u64>,
     #[serde(default)]
     pub overall_total: Option<u64>,
+    /// Сырая строка лога установщика загрузчика. В заголовок идёт
+    /// `current_file` (переведённая в человеческие слова фаза), а сюда —
+    /// необработанная строка для раскрываемого «подробнее».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// План деплоя: его собирает UI из `PackAnalysis` + выборов пользователя.
@@ -78,7 +83,14 @@ impl StageEvent {
             current_file,
             overall_done: None,
             overall_total: None,
+            detail: None,
         }
+    }
+
+    /// Событие с сырой строкой лога установщика для «подробнее».
+    pub fn with_detail(mut self, line: &str) -> Self {
+        self.detail = Some(line.to_string());
+        self
     }
 }
 

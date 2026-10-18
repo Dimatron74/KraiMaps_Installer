@@ -40,11 +40,19 @@ async function pickManualFolder() {
 <template>
   <div>
     <h2 class="text-lg font-bold text-primary">Куда ставим?</h2>
-    <p class="mt-1 text-sm text-secondary">Выберите лаунчер. Показаны только те, что найдены на этом компьютере.</p>
+
+    <Alert v-if="store.cancelledNotice" tone="info" class="mt-3">
+      {{ store.cancelledNotice }}
+    </Alert>
+    <p class="mt-1 text-sm text-secondary">
+      Выберите лаунчер. Показаны только те, что найдены на этом компьютере.
+    </p>
 
     <div class="mt-4 space-y-2">
       <button
-        v-for="l in store.detection?.launchers.filter((x) => (store.pack?.is_modded ? x.kind !== 'manual' : true)) ?? []"
+        v-for="l in store.detection?.launchers.filter((x) =>
+          store.pack?.is_modded ? x.kind !== 'manual' : true,
+        ) ?? []"
         :key="l.kind + l.data_dir"
         type="button"
         class="glass-card w-full p-4 text-left transition-colors hover:border-white/20 cursor-pointer"
@@ -62,15 +70,23 @@ async function pickManualFolder() {
         <p class="mt-0.5 truncate font-mono text-[11px] text-tertiary">{{ l.data_dir }}</p>
         <p class="mt-1 text-xs text-secondary">
           <template v-if="VERSION_LAUNCHERS.includes(l.kind)">
-            {{ l.targets.length === 0 ? 'Версий пока нет — установим нужную' : `Версий: ${l.targets.length}` }}
+            {{
+              l.targets.length === 0
+                ? 'Версий пока нет — установим нужную'
+                : `Версий: ${l.targets.length}`
+            }}
           </template>
           <template v-else>
-            {{ l.targets.length === 0 ? 'Инстансов пока нет — создадим новый' : `Инстансов: ${l.targets.length}` }}
+            {{
+              l.targets.length === 0
+                ? 'Инстансов пока нет — создадим новый'
+                : `Инстансов: ${l.targets.length}`
+            }}
           </template>
         </p>
         <p v-if="!l.app_found" class="mt-1 text-xs text-tertiary">
-          Приложение не найдено — осталась только папка с данными. Карту поставить можно, но запустить
-          лаунчер отсюда не выйдет.
+          Приложение не найдено — осталась только папка с данными. Карту поставить можно, но
+          запустить лаунчер отсюда не выйдет.
         </p>
       </button>
     </div>
@@ -86,7 +102,9 @@ async function pickManualFolder() {
       <Btn variant="secondary" :loading="store.busy" @click="store.rescanLaunchers()">
         {{ store.busy ? store.statusLine || 'Ищем…' : 'Повторить поиск' }}
       </Btn>
-      <Btn variant="secondary" :disabled="store.busy" @click="pickManualFolder()">Указать папку вручную</Btn>
+      <Btn variant="secondary" :disabled="store.busy" @click="pickManualFolder()"
+        >Указать папку вручную</Btn
+      >
     </div>
   </div>
 </template>

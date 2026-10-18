@@ -50,6 +50,7 @@ fn main() {
             commands::create_instance,
             commands::ensure_tlauncher_version,
             commands::ensure_legacy_version,
+            commands::cancel_provision,
             commands::ensure_official_installation,
             commands::add_official_quick_play,
             commands::prepare_instance_icon,

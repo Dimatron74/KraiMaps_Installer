@@ -70,7 +70,7 @@ function goHome() {
           не получится.
         </p>
       </Alert>
-      <Btn variant="secondary" @click="goHome()">В установки</Btn>
+      <Btn variant="secondary" @click="goHome()">На главную</Btn>
     </div>
   </div>
 </template>

@@ -37,6 +37,12 @@ pub enum InstallError {
     NoJava(String),
     #[error("не удалось подготовить версию игры")]
     ProvisionFailed(String),
+    /// Пользователь нажал «Отмена» на этапе установки загрузчика. Не ошибка:
+    /// отдельный вариант, чтобы UI не пугал красным экраном, а возвращал к
+    /// выбору лаунчера. Повторная попытка безопасна — см. метку недокачанной
+    /// версии.
+    #[error("установка отменена")]
+    Cancelled,
     #[error("ошибка запуска игры")]
     LaunchFailed(String),
     /// Сайт: нужна авторизация (401). UI ведёт на экран входа.
@@ -86,6 +92,12 @@ impl InstallError {
         matches!(self, Self::AuthRequired(_))
     }
 
+    /// Отмена по воле пользователя: ретраить нечего и показывать ошибкой
+    /// нельзя — это управляющее решение, а не сбой.
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+
     /// Стабильный код для UI («Подробнее»), логов и поддержки.
     pub fn code(&self) -> &'static str {
         match self {
@@ -102,6 +114,7 @@ impl InstallError {
             Self::UnknownLoader(_) => "E_UNKNOWN_LOADER",
             Self::NoJava(_) => "E_NO_JAVA",
             Self::ProvisionFailed(_) => "E_PROVISION_FAILED",
+            Self::Cancelled => "E_CANCELLED",
             Self::LaunchFailed(_) => "E_LAUNCH_FAILED",
             Self::AuthRequired(_) => "E_UNAUTHORIZED",
             Self::AccessDenied(_) => "E_ACCESS_DENIED",

@@ -38,6 +38,9 @@ const clamped = computed(() =>
     <p v-if="currentFile" class="mt-1 truncate font-mono text-[11px] text-tertiary">
       {{ currentFile }}
     </p>
+    <!-- Слот сразу под строкой статуса: для ссылок, которые должны выглядеть
+      частью этой строки, а не отдельным элементом под полосой. -->
+    <slot name="after" />
   </div>
 </template>
 

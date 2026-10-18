@@ -90,6 +90,14 @@ function effectiveLoaderVersion(state: {
 /** Ответ резолва версии загрузчика, пока он в полёте (см. `ensureLoaderVersion`). */
 let loaderVersionRequest: Promise<string | null> | null = null;
 
+/** Сколько строк живого лога установщика держим в памяти. */
+const PROVISION_LOG_MAX = 500;
+
+/** Отмена приходит как обычная ошибка команды — отличаем её по коду. */
+function isCancelError(e: unknown): boolean {
+  return (e as Partial<CmdError> | null)?.code === 'E_CANCELLED';
+}
+
 /** Подсказка следующего шага по коду ошибки (человекочитаемо, без жаргона). */
 function hintFor(code: string, running: LauncherKind[], launcher: LauncherKind | null): string {
   const name = launcher ? LAUNCHER_NAMES[launcher] : null;
@@ -195,6 +203,12 @@ export const useInstallStore = defineStore('install', {
     finalWorldName: '' as string,
     suggestedWorldName: '' as string,
     customWorldName: '' as string,
+    /** Живой лог установки загрузчика для раскрываемого «подробнее». */
+    provisionLog: [] as string[],
+    /** Отмена нажата: ждём `E_CANCELLED` из висящего `ensure_*`. */
+    cancelling: false,
+    /** Тихое уведомление после отмены (показывается на экране лаунчера). */
+    cancelledNotice: null as string | null,
     progress: null as StageEvent | null,
     report: null as DeployReport | null,
     error: null as InstallError | null,
@@ -406,6 +420,9 @@ export const useInstallStore = defineStore('install', {
       this.statusLine = '';
       this.wipeConfirmed = false;
       this.versionNote = null;
+      this.provisionLog = [];
+      this.cancelling = false;
+      this.cancelledNotice = null;
     },
 
     fail(e: unknown, returnStep: Step) {
@@ -578,6 +595,7 @@ export const useInstallStore = defineStore('install', {
       this.launcher = l;
       this.busy = false;
       this.statusLine = '';
+      this.cancelledNotice = null;
       // Экран цели показывает кнопку «подготовить версию» и подходящие версии,
       // а обе вещи зависят от точной версии загрузчика — резолвим её заранее.
       // Провал здесь не фатален: `createVersionTarget` повторит резолв и
@@ -815,8 +833,19 @@ export const useInstallStore = defineStore('install', {
       await this.beginInstallWork();
       this.statusLine = 'Готовим версию игры…';
       this.step = 'deploying';
+      this.provisionLog = [];
+      this.cancelling = false;
       const unlisten = await listen<StageEvent>('provision-progress', (event) => {
         this.progress = event.payload;
+        const line = event.payload.detail;
+        if (line) {
+          this.provisionLog.push(line);
+          // Лог живой и может расти на сотни строк: держим хвост, чтобы
+          // память и рендер не росли вместе с установкой.
+          if (this.provisionLog.length > PROVISION_LOG_MAX) {
+            this.provisionLog.splice(0, this.provisionLog.length - PROVISION_LOG_MAX);
+          }
+        }
       });
       try {
         const loaderVersion = await this.ensureLoaderVersion();
@@ -867,10 +896,39 @@ export const useInstallStore = defineStore('install', {
         await this.proceedAfterTarget();
       } catch (e) {
         await this.endInstallWork();
+        if (isCancelError(e)) {
+          this.finishCancel(wasStep);
+          return;
+        }
         this.fail(e, wasStep === 'deploying' ? 'target' : wasStep);
       } finally {
         unlisten();
       }
+    },
+
+    /**
+     * Отмена по воле пользователя: возвращаем к выбору лаунчера с тихой
+     * заметкой. Красный экран ошибки здесь врал бы — установка прервана
+     * намеренно, следов не осталось (бэкенд убрал докачанное и снёс процессы).
+     */
+    finishCancel(returnStep: Step) {
+      this.cancelling = false;
+      this.busy = false;
+      this.progress = null;
+      this.statusLine = '';
+      this.step = returnStep === 'deploying' ? 'launcher' : returnStep;
+      this.cancelledNotice =
+        'Установка отменена. Докачанные файлы убраны — следующая попытка начнётся заново.';
+    },
+
+    /** Кнопка «Отмена»: ставим флаг и ждём `E_CANCELLED` из висящего вызова. */
+    async cancelProvisioning() {
+      if (this.cancelling) return;
+      this.cancelling = true;
+      await api.cancelProvision().catch(() => {
+        // Флаг не дошёл — снимаем ожидание, установка продолжится как обычно.
+        this.cancelling = false;
+      });
     },
 
     confirmWipe() {

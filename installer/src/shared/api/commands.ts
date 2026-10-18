@@ -50,6 +50,12 @@ export const api = {
     return invoke('resolve_loader_version', { loader, mcVersion, hint });
   },
 
+  /** Прервать установку загрузчика. Уже висящий вызов `ensure_*` отдаст
+   * `E_CANCELLED`; сам вызов возвращается сразу. */
+  cancelProvision(): Promise<void> {
+    return invoke('cancel_provision');
+  },
+
   createInstance(args: {
     launcher: LauncherKind;
     dataDir: string;
@@ -124,7 +130,11 @@ export const api = {
    * Иконка нового инстанса из архива (`pack.png`/`icon.png`).
    * Best-effort: неуспех — это `null`, установка идёт дальше.
    */
-  prepareInstanceIcon(zipPath: string, contentPrefix: string, worldPrefix: string): Promise<string | null> {
+  prepareInstanceIcon(
+    zipPath: string,
+    contentPrefix: string,
+    worldPrefix: string,
+  ): Promise<string | null> {
     return invoke('prepare_instance_icon', { zipPath, contentPrefix, worldPrefix });
   },
 
@@ -134,7 +144,11 @@ export const api = {
   },
 
   /** Data URL иконки ресурспака (pack.png) для экрана проверки. Best-effort. */
-  resourcePackIcon(zipPath: string, source: string, kind: ResourcePackKind): Promise<string | null> {
+  resourcePackIcon(
+    zipPath: string,
+    source: string,
+    kind: ResourcePackKind,
+  ): Promise<string | null> {
     return invoke('resource_pack_icon', { zipPath, source, kind });
   },
 

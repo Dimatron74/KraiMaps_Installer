@@ -15,7 +15,30 @@
 use crate::domain::{GameTarget, InstallError, LauncherKind, LoaderKind};
 use crate::services::{deploy, java, site};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// Флаг отмены провижининга, который ставит команда `cancel_provision`.
+///
+/// Глобальный, а не в аргументах `provision`: отмена приходит другим Tauri-
+/// вызовом, пока исходный ещё висит, и передать ему токен по значению нельзя.
+/// Одновременных провижинингов не бывает — мастер ведёт одну установку, а
+/// [`provision`] сбрасывает флаг на старте.
+static PROVISION_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Попросить прервать текущую установку загрузчика.
+pub fn cancel_provision() {
+    PROVISION_CANCELLED.store(true, Ordering::SeqCst);
+}
+
+fn cancel_requested() -> bool {
+    PROVISION_CANCELLED.load(Ordering::SeqCst)
+}
+
+/// Как часто прерывающийся цикл проверяет отмену. Без этого тихий установщик
+/// заметил бы её только по таймауту молчания — через десять минут вместо
+/// мгновения.
+const CANCEL_POLL: Duration = Duration::from_millis(250);
 
 /// Суффикс-метка наших версий (`fabric-loader-0.19.5-1.20.1 [KK]`). Только
 /// созданные нами версии получают пометку — чужое не переименовываем.
@@ -678,6 +701,113 @@ pub fn installer_args(
     }
 }
 
+/// Что установщик загрузчика делает прямо сейчас — своими словами, без URL.
+///
+/// Установщики Forge/NeoForge/Fabric печатают в stdout построчный лог, где
+/// строка вида «Downloading library from https://maven.neoforged.net/…» идёт
+/// несколько сотен раз подряд. Пользователю это читается как «установщик
+/// KraiMaps сам что-то качает», хотя качает официальный установщик загрузчика.
+/// Поэтому в интерфейс уходит только фаза; сырой лог целиком остаётся в
+/// буфере и показывается в «Подробнее» при ошибке.
+///
+/// `None` — строка не меняет фазу (шум установщика: «Considering library …»,
+/// чексуммы, пустые строки). На экране остаётся предыдущая фаза.
+pub fn installer_phase(line: &str) -> Option<&'static str> {
+    let line = line.trim();
+    // Порядок важен: «Downloading libraries» ловим раньше, чем строки с
+    // артефактом, а строки процессоров — до общего случая.
+    if line.starts_with("Downloading libraries") || line.starts_with("Downloading library from") {
+        return Some("Скачиваем компоненты загрузчика…");
+    }
+    if line.starts_with("Patching ") {
+        return Some("Подгоняем игру под загрузчик…");
+    }
+    if line.starts_with("Processor:") || line.starts_with("Task:") {
+        return Some("Применяем обработчики загрузчика…");
+    }
+    if line.starts_with("Injecting profile") || line.starts_with("Successfully installed") {
+        return Some("Добавляем версию в лаунчер…");
+    }
+    None
+}
+
+/// Множество файлов в `libraries/` на момент снимка (пути относительно
+/// `libraries/`).
+fn library_snapshot(data_dir: &Path) -> std::collections::HashSet<PathBuf> {
+    walk_files(&data_dir.join("libraries"))
+}
+
+/// Убирает файлы, которых не было в снимке: докачанное отменённым запуском.
+///
+/// Удаляем только НОВЫЕ файлы. В `libraries/` лежат и библиотеки других версий
+/// пользователя — их не трогаем, поэтому «очистить папку целиком» здесь было бы
+/// самообрушением. Пустые каталоги, которые создал запуск, убираем снизу вверх.
+fn remove_new_libraries(data_dir: &Path, before: &std::collections::HashSet<PathBuf>) {
+    let root = data_dir.join("libraries");
+    let after = library_snapshot(data_dir);
+    for rel in after.difference(before) {
+        std::fs::remove_file(root.join(rel)).ok();
+    }
+    let mut dirs = walk_dirs(&root);
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for dir in dirs {
+        if std::fs::read_dir(&dir).is_ok_and(|mut r| r.next().is_none()) {
+            std::fs::remove_dir(&dir).ok();
+        }
+    }
+}
+
+fn walk_files(dir: &Path) -> std::collections::HashSet<PathBuf> {
+    walk_dirs(dir)
+        .into_iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|r| r.flatten())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.path().strip_prefix(dir).ok().map(Path::to_path_buf))
+        .collect()
+}
+
+/// Каталоги дерева, включая корневой, в порядке от корня вглубь.
+fn walk_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        out.push(dir.clone());
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                queue.push_back(p);
+            }
+        }
+    }
+    out
+}
+
+/// Убивает процесс вместе со всеми потомками.
+///
+/// Установщик NeoForge форкает отдельную JVM на каждый обработчик (`Processor:
+/// … -> PROCESS_MINECRAFT_JAR` в его логе), а обычный `kill` бьёт только по
+/// родителю. Без `taskkill /T` отмена оставляла бы ту JVM дописывать файлы в
+/// папку версии уже после того, как пользователь вернулся к выбору лаунчера, —
+/// ровно то «последствие», которого отмена не должна оставлять.
+fn kill_child_tree(child: &mut tokio::process::Child) {
+    #[cfg(windows)]
+    {
+        // Процесс мог завершиться сам — тогда и дерева нет, taskkill не нужен.
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    let _ = child.start_kill();
+}
+
 /// Лимиты прогона установщика: тишина в логе дольше 10 минут — считаем
 /// зависшим (убиваем); общий потолок 30 минут на медленные сети.
 const SILENCE_TIMEOUT_SECS: u64 = 600;
@@ -705,6 +835,8 @@ where
     for attempt in 1..=tries.max(1) {
         match op(attempt).await {
             Ok(out) => return Ok(out),
+            // Отмена — решение пользователя, повторять её три раза нельзя.
+            Err(e) if e.is_cancelled() => return Err(e),
             Err(e) => last_err = Some(e),
         }
     }
@@ -775,6 +907,13 @@ async fn download_installer(
         .await
         .map_err(InstallError::from)?;
     while let Some(chunk) = stream.next().await {
+        if cancel_requested() {
+            // Оборванный jar бесполезен, следующая попытка всё равно качала бы
+            // его заново с нуля.
+            drop(file);
+            std::fs::remove_file(dest).ok();
+            return Err(InstallError::Cancelled);
+        }
         let chunk = chunk
             .map_err(|e| InstallError::ProvisionFailed(format!("скачивание установщика: {e}")))?;
         done += chunk.len() as u64;
@@ -859,7 +998,13 @@ async fn run_command_with_limits(
     let mut last_output = start;
     let mut log = String::new();
     let mut line_no = 0u64;
+    let mut last_phase = "Запускаем установщик загрузчика…".to_string();
     loop {
+        if cancel_requested() {
+            kill_child_tree(&mut child);
+            let _ = child.wait().await;
+            return Err(InstallError::Cancelled);
+        }
         let silence_left = silence_timeout.checked_sub(last_output.elapsed());
         let total_left = total_timeout.checked_sub(start.elapsed());
         let wait_for = match (silence_left, total_left) {
@@ -868,7 +1013,7 @@ async fn run_command_with_limits(
             (Some(s), Some(t)) => Some(s.min(t)),
         };
         let Some(wait_for) = wait_for else {
-            let _ = child.kill().await;
+            kill_child_tree(&mut child);
             let _ = child.wait().await;
             let total_out = total_left.is_none();
             return Err(InstallError::ProvisionFailed(if total_out {
@@ -877,7 +1022,8 @@ async fn run_command_with_limits(
                 "установщик молчит больше 10 минут — похоже, завис".to_string()
             }));
         };
-        match tokio::time::timeout(wait_for, rx.recv()).await {
+        // Паузу режем до `CANCEL_POLL`, иначе отмена ждала бы таймаута молчания.
+        match tokio::time::timeout(wait_for.min(CANCEL_POLL), rx.recv()).await {
             Ok(Some(line)) => {
                 last_output = std::time::Instant::now();
                 line_no += 1;
@@ -889,13 +1035,17 @@ async fn run_command_with_limits(
                         log.drain(..at);
                     }
                 }
-                let shown: String = line.chars().take(200).collect();
-                progress(deploy::StageEvent::new(
-                    "installer-run",
-                    line_no,
-                    0,
-                    shown,
-                ));
+                // Фаза в заголовке не мигает на каждой строке: держим последнюю
+                // распознанную, а сырую строку отдаём в `detail` для
+                // «подробнее». Пользователь не должен видеть
+                // «Downloading library from https://…» вместо названия фазы.
+                if let Some(phase) = installer_phase(&line) {
+                    last_phase = phase.to_string();
+                }
+                progress(
+                    deploy::StageEvent::new("installer-run", line_no, 0, last_phase.clone())
+                        .with_detail(line.trim()),
+                );
             }
             Ok(None) => break, // оба пайпа закрыты
             Err(_) => continue, // тихий интервал вышел — пересчитаем таймауты
@@ -1067,6 +1217,7 @@ pub async fn provision(
     java_roots: &java::JavaRoots,
     progress: deploy::Progress<'_>,
 ) -> Result<String, InstallError> {
+    PROVISION_CANCELLED.store(false, Ordering::SeqCst);
     let req = java::java_req_for(loader, mc_version);
     let java_exe = java::resolve_java(java_roots, &req)?;
 
@@ -1124,11 +1275,21 @@ pub async fn provision(
         ensure_launcher_profiles(data_dir)?;
     }
     let args = installer_args(loader, mc_version, loader_version, data_dir);
+    // Снимок `libraries/` до прогона: по нему после отмены убираем ровно то,
+    // что докачал этот запуск, и не трогаем чужие версии пользователя.
+    let before = library_snapshot(data_dir);
     let run_result = run_installer(&java_exe, &jar_path, &args, progress).await;
     // Времянка установщика больше не нужна в любом исходе: состояние
     // продолжения живёт в игровых данных (библиотеки докачиваются поверх).
     std::fs::remove_dir_all(&workdir).ok();
-    let run_tail = run_result?;
+    let run_tail = match run_result {
+        Ok(tail) => tail,
+        Err(e) if e.is_cancelled() => {
+            remove_new_libraries(data_dir, &before);
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
     // Успех: снимаем маркер до рескана, иначе find_match нас же пропустит.
     std::fs::remove_file(&incomplete).ok();
     progress(deploy::StageEvent::new(
@@ -1722,7 +1883,8 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn run_command_streams_lines_and_reports_tail() {
+    async fn run_command_shows_phases_and_keeps_raw_log_for_details() {
+        let _guard = CANCEL_TEST_LOCK.lock().await;
         use std::sync::{Arc, Mutex};
         let shown = Arc::new(Mutex::new(Vec::<String>::new()));
         let shown_in = Arc::clone(&shown);
@@ -1730,7 +1892,15 @@ mod tests {
             Path::new("cmd.exe"),
             &[
                 "/C".to_string(),
-                "echo out-one & echo err-two 1>&2 & exit 1".to_string(),
+                concat!(
+                    "echo Downloading library from https://example.org/a.jar",
+                    " & echo Considering library foo",
+                    " & echo Injecting profile",
+                    " & echo out-one",
+                    " & echo err-two 1>&2",
+                    " & exit 1",
+                )
+                .to_string(),
             ],
             &|ev: deploy::StageEvent| {
                 shown_in.lock().unwrap().push(ev.current_file.clone());
@@ -1740,19 +1910,140 @@ mod tests {
         )
         .await;
         let err = r.expect_err("failing exit must error");
-        assert!(
-            err.details().contains("out-one"),
-            "tail must surface, got: {}",
-            err.details()
-        );
+        let details = err.details();
+        // Сырой лог целиком сохраняется — из него строится «Подробнее».
+        assert!(details.contains("out-one"), "stdout in log: {details}");
+        assert!(details.contains("err-two"), "stderr in log: {details}");
+
         let shown = shown.lock().unwrap();
-        assert!(shown.iter().any(|l| l.contains("out-one")), "stdout streamed");
-        assert!(shown.iter().any(|l| l.contains("err-two")), "stderr streamed");
+        assert!(
+            shown
+                .iter()
+                .any(|l| l.contains("Скачиваем компоненты загрузчика")),
+            "фаза скачивания показана: {shown:?}"
+        );
+        assert!(
+            shown.iter().any(|l| l.contains("Добавляем версию")),
+            "фаза добавления показана: {shown:?}"
+        );
+        // Регресс: URL установщика в интерфейс попадать не должен — пользователь
+        // принимает эти строки за наши собственные загрузки.
+        assert!(
+            !shown.iter().any(|l| l.contains("example.org")),
+            "URL не показываем: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|l| l.contains("Considering library")),
+            "шум установщика не показываем: {shown:?}"
+        );
     }
 
-    #[cfg(windows)]
+    /// Проверки, трогающие глобальный флаг отмены, идут строго по очереди:
+/// иначе один тест успеет поставить флаг и сорвёт другой. Асинхронный мьютекс,
+/// а не `std::sync::Mutex`: guard законно живёт через `.await`.
+#[cfg(test)]
+static CANCEL_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Отмена рвёт запущенный установщик сразу, а не ждёт его таймаута молчания.
+#[cfg(windows)]
+#[tokio::test]
+async fn cancel_stops_running_installer_at_once() {
+    let _guard = CANCEL_TEST_LOCK.lock().await;
+    PROVISION_CANCELLED.store(false, Ordering::SeqCst);
+    let start = std::time::Instant::now();
+    let run = tokio::spawn(async {
+        run_command_with_limits(
+            Path::new("cmd.exe"),
+            &["/C".to_string(), "ping -n 60 127.0.0.1 >nul".to_string()],
+            &|_: deploy::StageEvent| {},
+            Duration::from_secs(60),
+            Duration::from_secs(120),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    PROVISION_CANCELLED.store(true, Ordering::SeqCst);
+
+    let err = run.await.expect("join").expect_err("отмена обязана прервать");
+    assert!(err.is_cancelled(), "получили: {err:?}");
+    assert!(
+        start.elapsed() < Duration::from_secs(20),
+        "отмена не должна ждать таймаут молчания"
+    );
+    PROVISION_CANCELLED.store(false, Ordering::SeqCst);
+}
+
+/// Отмена — решение пользователя, ретраить её нельзя: иначе три попытки по
+/// тридцать секунд вместо одного мгновенного возврата.
+#[tokio::test]
+async fn cancel_is_not_retried() {
+    use std::sync::Arc;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let r = retry_async(3, move |_| {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err::<String, _>(InstallError::Cancelled)
+        }
+    })
+    .await;
+    assert!(r.expect_err("всегда ошибка").is_cancelled());
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "отмена не должна повторяться");
+}
+
+/// Отмена убирает только то, что докачал этот запуск: чужие версии
+/// пользователя лежат в той же `libraries/` и должны остаться целыми.
+#[test]
+fn cancel_removes_only_newly_downloaded_libraries() {
+    let root = temp_root("cancel-libs");
+    let libs = root.join("libraries");
+    let minecraft = libs.join("com").join("mojang").join("logging");
+    std::fs::create_dir_all(&minecraft).expect("mkdirs");
+    std::fs::write(minecraft.join("logging-1.1.1.jar"), b"old").expect("old");
+    let before = library_snapshot(&root);
+
+    let fresh = libs.join("net").join("neoforged").join("loader").join("10.0.36");
+    std::fs::create_dir_all(&fresh).expect("mkdirs");
+    std::fs::write(fresh.join("loader-10.0.36.jar"), b"new").expect("new");
+
+    remove_new_libraries(&root, &before);
+
+    assert!(minecraft.join("logging-1.1.1.jar").is_file(), "чужое не трогаем");
+    assert!(!fresh.join("loader-10.0.36.jar").exists(), "докачанное удалено");
+    assert!(!fresh.exists(), "пустой каталог установки тоже убран");
+}
+
+#[test]
+fn installer_phase_names_the_step_without_urls() {
+    use installer_phase as p;
+    assert_eq!(
+        p("Downloading library from https://maven.neoforged.net/releases/org/ow2/asm/asm.jar"),
+        Some("Скачиваем компоненты загрузчика…")
+    );
+    assert_eq!(
+        p("Downloading libraries"),
+        Some("Скачиваем компоненты загрузчика…")
+    );
+    assert_eq!(
+        p("Processor: net.neoforged.installertools:installertools -> PROCESS_MINECRAFT_JAR"),
+        Some("Применяем обработчики загрузчика…")
+    );
+    assert_eq!(
+        p("Patching net/minecraft/world/item/Items 1/1"),
+        Some("Подгоняем игру под загрузчик…")
+    );
+    assert_eq!(p("Injecting profile"), Some("Добавляем версию в лаунчер…"));
+    // Шум установщика фазу не меняет — на экране остаётся предыдущая.
+    assert_eq!(p("Considering library net.neoforged:neoforge:21.11.45"), None);
+    assert_eq!(p("  Download completed: Checksum validated."), None);
+    assert_eq!(p(""), None);
+}
+
+#[cfg(windows)]
     #[tokio::test]
     async fn run_command_kills_on_silence_timeout() {
+        let _guard = CANCEL_TEST_LOCK.lock().await;
         let start = std::time::Instant::now();
         let r = run_command_with_limits(
             Path::new("cmd.exe"),
