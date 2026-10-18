@@ -131,7 +131,7 @@ export const useSiteInstallStore = defineStore('site-install', {
         unlisten();
         this.step = 'handing';
         const install = useInstallStore();
-        install.loadManualRoots();
+        install.loadRoots();
         await install.pickZip(localPath);
         // Мета манифеста — строго после pickZip (он делает reset стора).
         // Иконку pickZip уже достал из архива сам (общий путь обоих потоков).

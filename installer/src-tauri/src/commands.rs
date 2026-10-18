@@ -4,7 +4,7 @@
 //! в событие `deploy-progress`. Ошибки — объектом
 //! `{code, message, details}` (код `E_*` для «Подробнее»).
 
-use crate::adapters::{legacy, manual, modrinth, official, prism, tlauncher, vanilla};
+use crate::adapters::{legacy, modrinth, official, prism, tlauncher, vanilla};
 use crate::domain::{
     GameTarget, InstallError, LauncherKind, LoaderKind, PackAnalysis,
 };
@@ -63,17 +63,12 @@ pub async fn analyze_pack(path: String) -> Cmd<PackAnalysis> {
         .map_err(CmdError::from)
 }
 
-/// Детект лаунчеров. `manual_roots` — ручные пути из store;
-/// `known_roots` — ранее найденные exe/корни (запоминает фронтенд),
-/// чтобы портативка находилась и без запуска.
+/// Детект лаунчеров. `known_roots` — ранее найденные exe/корни (запоминает
+/// фронтенд), чтобы портативка находилась и без запуска.
 #[tauri::command]
-pub async fn detect_launchers(
-    manual_roots: Vec<String>,
-    known_roots: Vec<String>,
-) -> Cmd<detect::Detection> {
-    let manuals: Vec<PathBuf> = manual_roots.into_iter().map(PathBuf::from).collect();
+pub async fn detect_launchers(known_roots: Vec<String>) -> Cmd<detect::Detection> {
     let known: Vec<PathBuf> = known_roots.into_iter().map(PathBuf::from).collect();
-    tauri::async_runtime::spawn_blocking(move || detect::detect_launchers(&manuals, &known))
+    tauri::async_runtime::spawn_blocking(move || detect::detect_launchers(&known))
         .await
         .map_err(CmdError::from)
 }
@@ -124,7 +119,6 @@ pub async fn create_instance(
             loader_version.as_deref(),
             icon_path.as_deref(),
         ),
-        LauncherKind::Manual => Err(InstallError::NoLauncher),
         // У TLauncher и Legacy Launcher нет инстансов: версии готовятся
         // командами `ensure_tlauncher_version` / `ensure_legacy_version`.
         LauncherKind::Tlauncher | LauncherKind::Legacy => Err(InstallError::NoLauncher),
@@ -159,7 +153,6 @@ pub async fn reopen_launcher(launcher: LauncherKind, exe: Option<String>) -> Cmd
     let exe = exe.map(PathBuf::from);
     tauri::async_runtime::spawn_blocking(move || match launcher {
         LauncherKind::Official => official::launch_official(exe.as_deref()),
-        LauncherKind::Manual => Err(InstallError::NoLauncher),
         _ => {
             let exe = exe.ok_or(InstallError::NoLauncher)?;
             detect::reopen_launcher(&exe)
@@ -182,10 +175,10 @@ pub async fn deploy_pack(
         | LauncherKind::Pinecone
         | LauncherKind::Polymc
         | LauncherKind::Multimc => normalize::prism_game_root(&target.path),
-        // Modrinth: профиль; TLauncher и ручная папка: сам game dir.
+        // Modrinth: профиль; TLauncher, Legacy и официальный: сам game dir.
         // Деплой пишет только файлы профиля (saves/mods/config), базу не
         // трогает — запущенное приложение не мешает, запрета нет.
-        LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
+        LauncherKind::Modrinth | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
             target.path.clone()
         }
     };
@@ -499,7 +492,7 @@ pub async fn suggest_world_name(target: GameTarget, world_name: String) -> Cmd<S
             | LauncherKind::Pinecone
             | LauncherKind::Polymc
             | LauncherKind::Multimc => normalize::prism_game_root(&target.path),
-            LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
+            LauncherKind::Modrinth | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
                 target.path.clone()
             }
         };
@@ -514,15 +507,14 @@ pub async fn suggest_world_name(target: GameTarget, world_name: String) -> Cmd<S
 
 /// Кнопка «Играть»: Prism-семейство — прямой запуск в мир (у PolyMC/MultiMC
 /// флаг `--world` опускается самим адаптером, см. `mmc_launch_args`),
-/// Modrinth — открыть приложение на профиле, ручная папка — открыть папку
-/// в проводнике. Возвращает команду для «Подробнее».
+/// Modrinth — открыть приложение на профиле, официальный — открыть
+/// приложение (по AUMID для Store-сборки). Возвращает команду для «Подробнее».
 #[tauri::command]
 pub async fn launch_game(
     launcher: LauncherKind,
     exe: Option<String>,
     instance_id: String,
     world: Option<String>,
-    folder: Option<String>,
 ) -> Cmd<String> {
     tauri::async_runtime::spawn_blocking(move || match launcher {
         LauncherKind::Prism
@@ -564,12 +556,6 @@ pub async fn launch_game(
         // У официального лаунчера нет CLI запуска: открываем приложение (по
         // AUMID, если Store-сборка) — профиль и так только что выбран нами.
         LauncherKind::Official => official::launch_official(exe.as_deref().map(Path::new)),
-        LauncherKind::Manual => {
-            let folder = folder
-                .map(PathBuf::from)
-                .ok_or(InstallError::NoLauncher)?;
-            manual::open_folder(&folder)
-        }
     })
     .await?
     .map_err(CmdError::from)

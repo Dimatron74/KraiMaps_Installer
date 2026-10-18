@@ -50,16 +50,7 @@ function goHome() {
     </Alert>
 
 <div class="mt-6 flex w-full max-w-md flex-col gap-2">
-      <Btn
-        v-if="store.target?.launcher === 'manual'"
-        variant="success"
-        size="lg"
-        :loading="store.busy"
-        @click="store.play()"
-      >
-        Открыть папку
-      </Btn>
-      <template v-else-if="store.launcher?.app_found">
+      <template v-if="store.launcher?.app_found">
         <Btn variant="success" size="lg" :loading="store.busy" @click="store.play()">
           Играть
         </Btn>

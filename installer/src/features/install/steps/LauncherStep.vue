@@ -1,8 +1,6 @@
 <script setup lang="ts">
-import { open } from '@tauri-apps/plugin-dialog';
 import { computed } from 'vue';
 import { useInstallStore, VERSION_LAUNCHERS } from '../../../app/stores/install';
-import { api } from '../../../shared/api/commands';
 import { LAUNCHER_NAMES, type LauncherInfo } from '../../../shared/types/installer';
 import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
@@ -10,16 +8,7 @@ import LauncherIcon from '../../../shared/ui/LauncherIcon.vue';
 
 const store = useInstallStore();
 
-/**
- * Модовую карту в папку «вручную» поставить нельзя: сборка идёт через
- * лаунчер (`.mrpack` импортируется лаунчером), поэтому такую карточку прячем.
- */
-const cards = computed<LauncherInfo[]>(
-  () =>
-    store.detection?.launchers.filter((l) =>
-      store.pack?.is_modded ? l.kind !== 'manual' : true,
-    ) ?? [],
-);
+const cards = computed<LauncherInfo[]>(() => store.detection?.launchers ?? []);
 
 /** «Версий: 3» / «Инстансов: 3», а для пустого лаунчера — что будет дальше. */
 function summary(l: LauncherInfo): string {
@@ -31,34 +20,6 @@ function summary(l: LauncherInfo): string {
   return VERSION_LAUNCHERS.includes(l.kind)
     ? `Версий: ${l.targets.length}`
     : `Инстансов: ${l.targets.length}`;
-}
-
-async function pickManualFolder() {
-  const selected = await open({ multiple: false, directory: true });
-  if (typeof selected === 'string') {
-    store.saveManualRoot(selected);
-    try {
-      store.busy = true;
-      const detection = await api.detectLaunchers(store.manualRoots, store.knownRoots);
-      store.detection = detection;
-      store.rememberRoots();
-      const manual = detection.launchers.find((l) => l.kind === 'manual');
-      if (manual) {
-        store.selectLauncher(manual);
-      } else {
-        store.fail(
-          {
-            code: 'E_NO_LAUNCHER',
-            message: 'Папка не похожа на игру',
-            details: 'no game markers (saves/versions/mods/config)',
-          },
-          'launcher',
-        );
-      }
-    } catch (e) {
-      store.fail(e, 'launcher');
-    }
-  }
 }
 </script>
 
@@ -132,7 +93,8 @@ async function pickManualFolder() {
 
     <Alert tone="info" class="mt-4">
       <p class="text-xs">
-        Нет нужного лаунчера? Запустите его и нажмите «Повторить поиск» или укажите папку вручную.
+        Нет нужного лаунчера? Запустите его и нажмите «Повторить поиск» — запущенный лаунчер
+        находится всегда.
       </p>
     </Alert>
 
@@ -141,9 +103,6 @@ async function pickManualFolder() {
       <Btn variant="secondary" :loading="store.busy" @click="store.rescanLaunchers()">
         {{ store.busy ? store.statusLine || 'Ищем…' : 'Повторить поиск' }}
       </Btn>
-      <Btn variant="secondary" :disabled="store.busy" @click="pickManualFolder()"
-        >Указать папку вручную</Btn
-      >
     </div>
   </div>
 </template>

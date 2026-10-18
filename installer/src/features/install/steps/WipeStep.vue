@@ -44,7 +44,7 @@ const sameVersionSlot = computed(
  */
 const canCreateInstance = computed(() => {
   const kind = store.target?.launcher;
-  if (!kind || kind === 'manual') return false;
+  if (!kind) return false;
   if (kind !== 'legacy' && kind !== 'tlauncher') return true;
   return !sameVersionSlot.value;
 });

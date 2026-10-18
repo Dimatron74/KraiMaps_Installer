@@ -11,7 +11,7 @@ async function pick() {
     filters: [{ name: 'Карта Minecraft', extensions: ['zip'] }],
   });
   if (typeof selected === 'string') {
-    store.loadManualRoots();
+    store.loadRoots();
     await store.pickZip(selected);
   }
 }

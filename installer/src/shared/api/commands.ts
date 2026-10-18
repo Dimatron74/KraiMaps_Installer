@@ -38,8 +38,8 @@ export const api = {
     return invoke('analyze_pack', { path });
   },
 
-  detectLaunchers(manualRoots: string[], knownRoots: string[]): Promise<Detection> {
-    return invoke('detect_launchers', { manualRoots, knownRoots });
+  detectLaunchers(knownRoots: string[]): Promise<Detection> {
+    return invoke('detect_launchers', { knownRoots });
   },
 
   resolveLoaderVersion(
@@ -184,7 +184,6 @@ export const api = {
     exe: string | null;
     instanceId: string;
     world: string | null;
-    folder: string | null;
   }): Promise<string> {
     return invoke('launch_game', args);
   },

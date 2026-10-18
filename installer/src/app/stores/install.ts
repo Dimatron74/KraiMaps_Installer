@@ -54,7 +54,6 @@ export function mapSiteLoaderSlug(slug: string | null | undefined): LoaderKind |
   return null;
 }
 
-const MANUAL_ROOTS_KEY = 'mi.manualRoots';
 const KNOWN_ROOTS_KEY = 'mi.knownRoots';
 
 /**
@@ -215,7 +214,6 @@ export const useInstallStore = defineStore('install', {
     errorReturnStep: 'file' as Step,
     busy: false,
     statusLine: '' as string,
-    manualRoots: [] as string[],
     /** Ранее найденные exe/корни: портативка находится и без запуска. */
     knownRoots: [] as string[],
     /** Идёт ли деплой модов с wipe (для экрана wipe). */
@@ -241,7 +239,6 @@ export const useInstallStore = defineStore('install', {
       const pack = state.pack;
       const launcher = state.launcher;
       if (!pack || !launcher) return [];
-      if (launcher.kind === 'manual') return pack.is_modded ? [] : launcher.targets;
       const loaderVersion = effectiveLoaderVersion(state);
       return launcher.targets.filter((t) => {
         if (pack.world_version && t.minecraft_version !== pack.world_version) return false;
@@ -293,7 +290,7 @@ export const useInstallStore = defineStore('install', {
     newTargetCta(state): { title: string; hint: string } | null {
       const pack = state.pack;
       const launcher = state.launcher;
-      if (!pack || !launcher || launcher.kind === 'manual') return null;
+      if (!pack || !launcher) return null;
       const mc = pack.world_version ?? '';
       const mapName = state.siteTitle ?? pack.world_name;
 
@@ -332,12 +329,7 @@ export const useInstallStore = defineStore('install', {
     },
 
     needsWipe(state): boolean {
-      return !!(
-        state.pack?.is_modded &&
-        state.target &&
-        !state.targetIsFresh &&
-        state.target.launcher !== 'manual'
-      );
+      return !!(state.pack?.is_modded && state.target && !state.targetIsFresh);
     },
 
     /**
@@ -361,20 +353,11 @@ export const useInstallStore = defineStore('install', {
   },
 
   actions: {
-    loadManualRoots() {
+    loadRoots() {
       try {
-        this.manualRoots = JSON.parse(localStorage.getItem(MANUAL_ROOTS_KEY) ?? '[]');
         this.knownRoots = JSON.parse(localStorage.getItem(KNOWN_ROOTS_KEY) ?? '[]');
       } catch {
-        this.manualRoots = [];
         this.knownRoots = [];
-      }
-    },
-
-    saveManualRoot(path: string) {
-      if (!this.manualRoots.includes(path)) {
-        this.manualRoots.push(path);
-        localStorage.setItem(MANUAL_ROOTS_KEY, JSON.stringify(this.manualRoots));
       }
     },
 
@@ -543,20 +526,13 @@ export const useInstallStore = defineStore('install', {
       this.busy = true;
       this.statusLine = 'Ищем лаунчеры…';
       try {
-        this.detection = await api.detectLaunchers(this.manualRoots, this.knownRoots);
+        this.detection = await api.detectLaunchers(this.knownRoots);
         this.rememberRoots();
-        // Запоминаем только валидные ручные корни (детект их принял).
-        for (const l of this.detection.launchers) {
-          if (l.kind === 'manual') this.saveManualRoot(l.data_dir);
-        }
-        const launchers = this.detection.launchers.filter((l) =>
-          this.pack?.is_modded ? l.kind !== 'manual' : true,
-        );
-        if (launchers.length === 0) {
+        if (this.detection.launchers.length === 0) {
           throw { code: 'E_NO_LAUNCHER', message: 'Лаунчеры не найдены', details: 'no launchers' };
         }
-        if (launchers.length === 1) {
-          this.selectLauncher(launchers[0]!);
+        if (this.detection.launchers.length === 1) {
+          this.selectLauncher(this.detection.launchers[0]!);
         } else {
           this.busy = false;
           this.statusLine = '';
@@ -572,16 +548,13 @@ export const useInstallStore = defineStore('install', {
       this.busy = true;
       this.statusLine = 'Ищем лаунчеры…';
       try {
-        this.detection = await api.detectLaunchers(this.manualRoots, this.knownRoots);
+        this.detection = await api.detectLaunchers(this.knownRoots);
         this.rememberRoots();
-        const launchers = this.detection.launchers.filter((l) =>
-          this.pack?.is_modded ? l.kind !== 'manual' : true,
-        );
-        if (launchers.length === 0) {
+        if (this.detection.launchers.length === 0) {
           throw { code: 'E_NO_LAUNCHER', message: 'Лаунчеры не найдены', details: 'rescan: none' };
         }
-        if (launchers.length === 1) {
-          this.selectLauncher(launchers[0]!);
+        if (this.detection.launchers.length === 1) {
+          this.selectLauncher(this.detection.launchers[0]!);
         } else {
           this.busy = false;
           this.statusLine = '';
@@ -644,11 +617,11 @@ export const useInstallStore = defineStore('install', {
     /**
      * Закрывает запущенный лаунчер до первого бэкенд-вызова и запоминает,
      * работал ли он (OR-накопление: путь через create и путь через deploy
-     * дополняют друг друга, а не затирают). Ручной папке закрывать нечего.
+     * дополняют друг друга, а не затирают).
      */
     async beginInstallWork() {
       const launcher = this.launcher;
-      if (!launcher || launcher.kind === 'manual') return;
+      if (!launcher) return;
       try {
         this.launcherWasRunning =
           (await api.closeLauncher(launcher.kind)) || this.launcherWasRunning;
@@ -672,7 +645,7 @@ export const useInstallStore = defineStore('install', {
     async createNewTarget() {
       const pack = this.pack;
       const launcher = this.launcher;
-      if (!pack || !launcher || launcher.kind === 'manual') return;
+      if (!pack || !launcher) return;
       // У TLauncher, Legacy Launcher и официального лаунчера цели — версии,
       // а не инстансы: их готовит отдельная команда, `create_instance` не
       // вызывается.
@@ -736,7 +709,7 @@ export const useInstallStore = defineStore('install', {
         });
         this.targetIsFresh = true;
         // Обновляем детект, чтобы новый инстанс был виден везде.
-        this.detection = await api.detectLaunchers(this.manualRoots, this.knownRoots);
+        this.detection = await api.detectLaunchers(this.knownRoots);
         this.rememberRoots();
         // Привязка строго по папке данных: однотипных лаунчеров может быть несколько.
         this.launcher =
@@ -887,7 +860,7 @@ export const useInstallStore = defineStore('install', {
           this.versionNote = `${LAUNCHER_NAMES[kind]} не удалось закрыть — выберите версию «${res.target.name}» в лаунчере вручную.`;
         }
         // Обновляем детект, чтобы подготовленная версия была видна везде.
-        this.detection = await api.detectLaunchers(this.manualRoots, this.knownRoots);
+        this.detection = await api.detectLaunchers(this.knownRoots);
         this.rememberRoots();
         this.launcher =
           this.detection.launchers.find(
@@ -1072,7 +1045,6 @@ export const useInstallStore = defineStore('install', {
             exe,
             instanceId: target.path,
             world: this.report.world_dir_name,
-            folder: null,
           });
         } else if (target.launcher === 'modrinth') {
           await api.launchGame({
@@ -1080,9 +1052,8 @@ export const useInstallStore = defineStore('install', {
             exe,
             instanceId: target.path,
             world: null,
-            folder: null,
           });
-        } else if (isVersionLauncher(target.launcher)) {
+        } else {
           // Для TLauncher/Legacy `instanceId` — имя версии (её выбирает CLI
           // лаунчера), для официального — что угодно: запускается приложение.
           await api.launchGame({
@@ -1090,15 +1061,6 @@ export const useInstallStore = defineStore('install', {
             exe,
             instanceId: target.name,
             world: null,
-            folder: null,
-          });
-        } else {
-          await api.launchGame({
-            launcher: 'manual',
-            exe: null,
-            instanceId: target.path,
-            world: null,
-            folder: target.path,
           });
         }
       } catch (e) {

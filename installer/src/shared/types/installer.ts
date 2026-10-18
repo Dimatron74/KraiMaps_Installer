@@ -1,15 +1,7 @@
 /** TS-зеркала доменных типов Rust (src-tauri/src/domain). */
 
 export type LauncherKind =
-  | 'prism'
-  | 'pinecone'
-  | 'polymc'
-  | 'multimc'
-  | 'modrinth'
-  | 'manual'
-  | 'tlauncher'
-  | 'legacy'
-  | 'official';
+  'prism' | 'pinecone' | 'polymc' | 'multimc' | 'modrinth' | 'tlauncher' | 'legacy' | 'official';
 export type LoaderKind = 'vanilla' | 'fabric' | 'forge' | 'quilt' | 'neoforge';
 
 export interface ModInfo {
@@ -152,7 +144,6 @@ export const LAUNCHER_NAMES: Record<LauncherKind, string> = {
   polymc: 'PolyMC',
   multimc: 'MultiMC',
   modrinth: 'Modrinth App',
-  manual: 'Папка вручную',
   tlauncher: 'TLauncher',
   legacy: 'Legacy Launcher',
   official: 'Minecraft Launcher',

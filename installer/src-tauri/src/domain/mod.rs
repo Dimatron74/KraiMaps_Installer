@@ -177,7 +177,6 @@ pub enum LauncherKind {
     Polymc,
     Multimc,
     Modrinth,
-    Manual,
     Tlauncher,
     Legacy,
     Official,

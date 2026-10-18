@@ -2,9 +2,9 @@
 //!
 //! Принципы (согласованы с пользователем):
 //! - никакого full-disk scan — только точечные O(1)-проверки, параллельно;
-//! - слои: сохранённые ручные пути → реестр протоколов/ассоциаций →
-//!   запущенные процессы → известные корни (+портативка рядом с exe) → PATH;
-//! - ручной выбор — последний fallback, один раз, с запоминанием в store;
+//! - слои: реестр протоколов/ассоциаций → запущенные процессы → известные
+//!   корни (+портативка рядом с exe) → PATH;
+//! - лаунчер, который пользователь запускает, находится всегда;
 //! - кандидаты валидируются маркерами, скоринг только для сортировки.
 
 use crate::adapters::tlauncher::is_tlauncher_data_dir;
@@ -24,58 +24,20 @@ pub struct Detection {
     pub running: Vec<LauncherKind>,
 }
 
-/// Полный детект. `manual_roots` — ручные пути из store (слой 0, они же
-/// кандидаты в ручные папки). `known_roots` — ранее найденные exe/корни
-/// (запоминает фронтенд): так портативка находится и без запуска.
-pub fn detect_launchers(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Detection {
+/// Полный детект. `known_roots` — ранее найденные exe/корни (запоминает
+/// фронтенд): так портативка находится и без запуска лаунчера.
+pub fn detect_launchers(known_roots: &[PathBuf]) -> Detection {
     let processes = running_launcher_processes();
 
     let mut launchers: Vec<LauncherInfo> = Vec::new();
-    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &PRISM));
-    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &PINECONE));
-    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &POLYMC));
-    launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &MULTIMC));
-    launchers.extend(detect_modrinth(manual_roots, known_roots, &processes));
-    launchers.extend(detect_tlauncher(manual_roots, known_roots));
-    let legacy = detect_legacy(manual_roots, known_roots);
-    let official = detect_official(manual_roots, known_roots);
-    launchers.extend(legacy.iter().cloned());
-    launchers.extend(official.iter().cloned());
-
-// Папки, которые уже заняты карточками Legacy/официального лаунчера:
-    // ручной путь в них не должен превращаться в ещё одну карточку «вручную».
-    let claimed: Vec<PathBuf> = legacy
-        .iter()
-        .map(|l| l.data_dir.clone())
-        .chain(official.iter().map(|l| l.data_dir.clone()))
-        .collect();
-
-    for root in manual_roots {
-        if is_any_mmc_data_dir(root) || is_modrinth_data_dir(root) {
-            continue; // уже покрыты выше
-        }
-        // `.minecraft` общий у TLauncher и официального лаунчера, а папка игры
-        // Legacy лежит внутри `.tlauncher`. Владелец один: кто специфичнее по
-        // маркерам, тот и забирает корень (иначе одна папка дала бы две
-        // карточки-дубля).
-        if is_tlauncher_data_dir(root)
-            || is_official_data_dir(root)
-            || claimed.iter().any(|d| d == root)
-        {
-            continue;
-        }
-if let Some(target) = manual_target(root) {
-            launchers.push(LauncherInfo {
-                kind: LauncherKind::Manual,
-                display_name: format!("Папка: {}", target.name),
-                exe_path: None,
-                data_dir: root.clone(),
-                portable: false,
-                targets: vec![target],
-                app_found: true,
-            });
-        }
-    }
+    launchers.extend(detect_mmc(known_roots, &processes, &PRISM));
+    launchers.extend(detect_mmc(known_roots, &processes, &PINECONE));
+    launchers.extend(detect_mmc(known_roots, &processes, &POLYMC));
+    launchers.extend(detect_mmc(known_roots, &processes, &MULTIMC));
+    launchers.extend(detect_modrinth(known_roots, &processes));
+    launchers.extend(detect_tlauncher(known_roots));
+    launchers.extend(detect_legacy(known_roots));
+    launchers.extend(detect_official(known_roots));
 
     let extra: [(LauncherKind, bool); 2] = [
         (
@@ -174,24 +136,21 @@ fn mmc_family(kind: LauncherKind) -> &'static MmcFamily {
         LauncherKind::Pinecone => &PINECONE,
         LauncherKind::Polymc => &POLYMC,
         LauncherKind::Multimc => &MULTIMC,
-        LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
+        LauncherKind::Modrinth | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
             panic!("not an MMC-family launcher")
         }
     }
 }
 
 /// Сбор корней Prism-семейства: портативки рядом с каждым найденным exe
-/// (слой processes/реестр/известные/PATH/ярлыки/запомненные/ручные) +
-/// стандартный корень. Одинаковые корни схлопываются — разные остаются
-/// разными карточками.
+/// (слой processes/реестр/известные/PATH/ярлыки) + стандартный корень.
+/// Одинаковые корни схлопываются — разные остаются разными карточками.
 fn detect_mmc(
-    manual_roots: &[PathBuf],
     known_roots: &[PathBuf],
     processes: &[RunningLauncher],
     fam: &'static MmcFamily,
 ) -> Vec<LauncherInfo> {
     let mut exes: Vec<PathBuf> = Vec::new();
-    exes.extend(manual_roots.iter().filter(|p| is_mmc_exe(p, fam)).cloned());
     exes.extend(known_roots.iter().filter(|p| is_mmc_exe(p, fam)).cloned());
     exes.extend(
         processes
@@ -230,7 +189,7 @@ fn detect_mmc(
             portable: false,
         });
     }
-    for root in manual_roots.iter().chain(known_roots.iter()) {
+    for root in known_roots {
         if is_mmc_data_dir(root, fam) && mmc_claim(root, fam.kind) {
             roots.push(DataRoot {
                 exe: None,
@@ -264,12 +223,10 @@ dedup_roots(roots)
 /// Сбор корней Modrinth App — симметрично Prism (портативный режим тоже
 /// возможен: данные рядом с exe проверяются теми же маркерами).
 fn detect_modrinth(
-    manual_roots: &[PathBuf],
     known_roots: &[PathBuf],
     processes: &[RunningLauncher],
 ) -> Vec<LauncherInfo> {
     let mut exes: Vec<PathBuf> = Vec::new();
-    exes.extend(manual_roots.iter().filter(|p| is_modrinth_exe(p)).cloned());
     exes.extend(known_roots.iter().filter(|p| is_modrinth_exe(p)).cloned());
     exes.extend(
         processes
@@ -302,7 +259,7 @@ fn detect_modrinth(
             portable: false,
         });
     }
-    for root in manual_roots.iter().chain(known_roots.iter()) {
+    for root in known_roots {
         if is_modrinth_data_dir(root) {
             roots.push(DataRoot {
                 exe: None,
@@ -394,19 +351,17 @@ fn app_installed(kind: LauncherKind, exe: Option<&Path>) -> bool {
         LauncherKind::Tlauncher => &["tlauncher"],
         LauncherKind::Legacy => &["legacy launcher"],
         LauncherKind::Official => &["minecraft launcher"],
-        LauncherKind::Manual => &[],
     };
     !fragments.is_empty() && registered_in_windows(fragments)
 }
 
 /// Сбор корней TLauncher: дефолтный `.minecraft` + `minecraft.gamedir`
-/// из конфига + ручные/известные корни и exe. Инстансов нет — цели
+/// из конфига + известные корни и exe. Инстансов нет — цели
 /// перечисляются из `versions/` при сборке карточки.
-fn detect_tlauncher(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
+fn detect_tlauncher(known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
     use crate::adapters::tlauncher as tl;
     let mut roots: Vec<DataRoot> = Vec::new();
     let mut exes: Vec<PathBuf> = Vec::new();
-    exes.extend(manual_roots.iter().filter(|p| is_tlauncher_exe(p)).cloned());
     exes.extend(known_roots.iter().filter(|p| is_tlauncher_exe(p)).cloned());
     exes.extend(start_menu_exes().into_iter().filter(|p| is_tlauncher_exe(p)));
     for exe in &exes {
@@ -437,7 +392,7 @@ fn detect_tlauncher(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<La
             portable: false,
         });
     }
-    for root in manual_roots.iter().chain(known_roots.iter()) {
+    for root in known_roots {
         if tl::is_tlauncher_data_dir(root) {
             roots.push(DataRoot {
                 exe: tl::find_tlauncher_exe(root),
@@ -472,19 +427,13 @@ dedup_roots(roots)
 /// `LL.exe` и `tl.properties`), из них берётся `minecraft.gamedir` — папка
 /// игры. Инстансов нет: цели перечисляются из `versions/` при сборке карточки,
 /// а `path` цели — подпапка выбранного в лаунчере режима.
-fn detect_legacy(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
+fn detect_legacy(known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
     use crate::adapters::legacy as lg;
     let mut install_dirs: Vec<PathBuf> = Vec::new();
     if let Some(roaming) = std::env::var_os("APPDATA").map(PathBuf::from) {
         install_dirs.extend(lg::known_install_dirs(&roaming));
     }
-    install_dirs.extend(
-        manual_roots
-            .iter()
-            .chain(known_roots.iter())
-            .filter(|p| lg::is_install_dir(p))
-            .cloned(),
-    );
+    install_dirs.extend(known_roots.iter().filter(|p| lg::is_install_dir(p)).cloned());
 let mut seen: std::collections::BTreeSet<PathBuf> = Default::default();
 
     let mut out: Vec<LauncherInfo> = Vec::new();
@@ -531,7 +480,7 @@ fn data_dir_owner(dir: &Path) -> Option<LauncherKind> {
 /// Сбор корней официального Minecraft Launcher: `%APPDATA%\.minecraft`.
 /// Store-сборка лежит в `WindowsApps` и для прямого запуска закрыта, поэтому
 /// exe тут нужен только для старой Standalone-сборки; Store поднимаем по AUMID.
-fn detect_official(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
+fn detect_official(known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
     let mut roots: Vec<DataRoot> = Vec::new();
     if let Some(roaming) = std::env::var_os("APPDATA").map(PathBuf::from) {
         let def = crate::adapters::official::default_data_dir(&roaming);
@@ -543,7 +492,7 @@ fn detect_official(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<Lau
             });
         }
     }
-    for root in manual_roots.iter().chain(known_roots.iter()) {
+    for root in known_roots {
         if is_official_data_dir(root) && data_dir_owner(root) == Some(LauncherKind::Official) {
             roots.push(DataRoot {
                 exe: official_exe(),
@@ -721,9 +670,6 @@ fn is_store_launcher_process(exe: Option<&Path>) -> bool {
 /// установка продолжается (fail-open, как раньше у Modrinth).
 pub fn close_launcher(kind: LauncherKind) -> bool {
     use sysinfo::{ProcessesToUpdate, System};
-    if kind == LauncherKind::Manual {
-        return false;
-    }
     let mut sys = System::new();
     let mut was_running = false;
     for _ in 0..40 {
@@ -837,7 +783,7 @@ fn known_mmc_exe(fam: &MmcFamily) -> Vec<PathBuf> {
             // У MultiMC штатного установщика нет — только портативка, её ловят
             // процессы/ярлыки/PATH/ручные корни.
             LauncherKind::Multimc => {}
-            LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {}
+            LauncherKind::Modrinth | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {}
         }
     }
     #[cfg(not(windows))]
@@ -933,8 +879,8 @@ fn data_root_next_to_exe(exe: &Path, kind: LauncherKind) -> Option<PathBuf> {
             is_mmc_data_dir(dir, mmc_family(kind))
         }
         LauncherKind::Modrinth => is_modrinth_data_dir(dir),
-        // Ручная папка и TLauncher разбираются отдельно (см. ниже).
-        LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => false,
+        // TLauncher/Legacy/официальный разбираются отдельно (см. ниже).
+        LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => false,
     };
     let dir = exe.parent()?;
     if is_data(dir) {
@@ -1140,14 +1086,8 @@ fn is_mmc_data_dir(p: &Path, fam: &MmcFamily) -> bool {
             || fam.cfg_markers.iter().any(|m| p.join(m).is_file()))
 }
 
-fn is_any_mmc_data_dir(p: &Path) -> bool {
-    [&PRISM, &PINECONE, &POLYMC, &MULTIMC]
-        .into_iter()
-        .any(|fam| is_mmc_data_dir(p, fam))
-}
-
 /// Владелец корня по cfg-маркеру (`polymc.cfg` → PolyMC...). Один корень —
-/// одна семья: иначе ручной корень с общим `instances/` давал бы четыре
+/// одна семья: иначе корень с общим `instances/` давал бы четыре
 /// карточки-дубля. Bare-каталог (только `instances/`, без cfg) забирает
 /// Prism — историческое поведение детекта.
 fn mmc_owner(root: &Path) -> Option<LauncherKind> {
@@ -1358,32 +1298,6 @@ pub fn read_modrinth_targets(data_dir: &Path) -> Result<Vec<GameTarget>, crate::
     Ok(out)
 }
 
-/// Папка вручную: валидна, если похожа на игру (saves/versions/mods/config).
-fn manual_target(dir: &Path) -> Option<GameTarget> {
-    if !dir.is_dir() {
-        return None;
-    }
-    let looks_like_game = ["saves", "versions", "mods", "config", ".minecraft"]
-        .iter()
-        .any(|m| dir.join(m).is_dir());
-    if !looks_like_game {
-        return None;
-    }
-    let game_root = if dir.join(".minecraft").is_dir() {
-        dir.join(".minecraft")
-    } else {
-        dir.to_path_buf()
-    };
-    Some(GameTarget {
-        launcher: LauncherKind::Manual,
-        name: dir_name(dir),
-        path: game_root,
-        minecraft_version: String::new(), // версия неизвестна — только ванилла
-        loader: LoaderKind::Vanilla,
-        loader_version: None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1541,13 +1455,11 @@ mod tests {
         std::fs::create_dir_all(bare.join("instances")).expect("bare instances");
         assert!(mmc_claim(&bare, LauncherKind::Prism));
         assert!(!mmc_claim(&bare, LauncherKind::Pinecone));
-        // Чужой каталог корнем не считается.
-        assert!(!is_any_mmc_data_dir(&root));
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn manual_mmc_root_yields_single_card() {
+    fn known_mmc_root_yields_single_card() {
         let root = temp_root("mmc-single");
         let inst = root.join("instances").join("Alpha");
         write(&inst.join("instance.cfg"), &fabric_instance_cfg("Alpha"));
@@ -1556,7 +1468,7 @@ mod tests {
             &mmc_pack("1.21.11", Some(("net.fabricmc.fabric-loader", "0.19.5"))),
         );
         write(&root.join("polymc.cfg"), "InstanceDir=instances\n");
-        let detection = detect_launchers(&[(*root).clone()], &[]);
+        let detection = detect_launchers(&[(*root).clone()]);
         let ours: Vec<_> = detection
             .launchers
             .iter()
@@ -1567,11 +1479,6 @@ mod tests {
         assert_eq!(ours[0].targets.len(), 1);
         assert_eq!(ours[0].targets[0].launcher, LauncherKind::Polymc);
         std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn manual_kind_never_closes() {
-        assert!(!close_launcher(LauncherKind::Manual));
     }
 
     #[test]
@@ -1721,16 +1628,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    #[test]
-    fn manual_folder_needs_game_markers() {
-        let root = temp_root("manual");
-        assert!(manual_target(&root).is_none());
-        std::fs::create_dir_all(root.join("saves")).expect("saves");
-        let target = manual_target(&root).expect("target");
-        assert_eq!(target.loader, LoaderKind::Vanilla);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     fn tlauncher_root_with_fabric(tag: &str) -> crate::test_utils::TempDir {
         let root = temp_root(tag);
         let vdir = root.join("versions").join("fabric-loader-0.19.5-1.20.1");
@@ -1749,7 +1646,7 @@ mod tests {
     #[test]
     fn tlauncher_root_is_detected_with_targets() {
         let root = tlauncher_root_with_fabric("tl");
-        let found = detect_tlauncher(&[(*root).clone()], &[]);
+        let found = detect_tlauncher(&[(*root).clone()]);
         let ours = found.iter().find(|l| l.data_dir == root).expect("tl root");
         assert_eq!(ours.kind, LauncherKind::Tlauncher);
         assert_eq!(ours.exe_path, Some(root.join("TLauncher.exe")));
@@ -1766,16 +1663,17 @@ mod tests {
         let root = temp_root("official");
         std::fs::create_dir_all(root.join("versions")).expect("versions");
         write(&root.join("launcher_profiles.json"), "{}");
-        let found = detect_tlauncher(&[], &[]);
+        let found = detect_tlauncher(&[]);
         assert!(found.iter().all(|l| l.data_dir != root));
         std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
-    fn tlauncher_data_dir_beats_manual_target() {
-        // Корень TL не должен дублироваться карточкой «Папка вручную».
+    fn tlauncher_data_dir_is_not_official() {
+        // `.minecraft` TLauncher не должен отдаваться карточке официального
+        // лаунчера: один корень — один владелец.
         let root = tlauncher_root_with_fabric("tl-nodupe");
-        let detection = detect_launchers(&[(*root).clone()], &[]);
+        let detection = detect_launchers(&[(*root).clone()]);
         assert!(
             detection
                 .launchers
@@ -1787,7 +1685,7 @@ mod tests {
             detection
                 .launchers
                 .iter()
-                .all(|l| !(l.kind == LauncherKind::Manual && l.data_dir == root))
+                .all(|l| !(l.kind == LauncherKind::Official && l.data_dir == root))
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1796,7 +1694,7 @@ mod tests {
     #[test]
     #[ignore = "живой прогон по системе; запускается вручную"]
     fn live_detection_smoke() {
-        let d = detect_launchers(&[], &[]);
+        let d = detect_launchers(&[]);
         println!("запущены: {:?}", d.running);
         for l in &d.launchers {
             println!(

@@ -7,12 +7,8 @@
  * бандлом, поэтому путь не зависит от base и не ломается в сборке под
  * NSIS. Импорт же даёт проверку типов и мгновенное подсказывание при
  * переименовании файла.
- *
- * `manual` — свой SVG: на сайте папки вручную нет, а лаунчером она не
- * является, но плитка в списке должна быть у каждой карточки.
  */
 import legacyIcon from './legacy.webp';
-import manualIcon from './manual.svg';
 import minecraftIcon from './minecraft.webp';
 import modrinthIcon from './modrinth.webp';
 import multimcIcon from './multimc.webp';
@@ -28,7 +24,6 @@ export const LAUNCHER_ICONS: Record<LauncherKind, string> = {
   polymc: polymcIcon,
   multimc: multimcIcon,
   modrinth: modrinthIcon,
-  manual: manualIcon,
   tlauncher: tlauncherIcon,
   legacy: legacyIcon,
   official: minecraftIcon,
