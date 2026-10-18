@@ -1,4 +1,4 @@
-//! Детект лаунчеров и их инстансов/профилей (§6.14 ТЗ, §5–6 дизайн-дока).
+﻿//! Детект лаунчеров и их инстансов/профилей (§6.14 ТЗ, §5–6 дизайн-дока).
 //!
 //! Принципы (согласованы с пользователем):
 //! - никакого full-disk scan — только точечные O(1)-проверки, параллельно;
@@ -7,6 +7,7 @@
 //! - ручной выбор — последний fallback, один раз, с запоминанием в store;
 //! - кандидаты валидируются маркерами, скоринг только для сортировки.
 
+use crate::adapters::tlauncher::is_tlauncher_data_dir;
 use crate::domain::{GameTarget, LauncherInfo, LauncherKind, LoaderKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,8 +19,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Detection {
     pub launchers: Vec<LauncherInfo>,
-    pub modrinth_running: bool,
-    pub tlauncher_running: bool,
+    /// Какие лаунчеры сейчас запущены. Список, а не набор булевых флагов:
+    /// лаунчеров много, а подсказка про ошибку интересует все закрываемые.
+    pub running: Vec<LauncherKind>,
 }
 
 /// Полный детект. `manual_roots` — ручные пути из store (слой 0, они же
@@ -27,9 +29,6 @@ pub struct Detection {
 /// (запоминает фронтенд): так портативка находится и без запуска.
 pub fn detect_launchers(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Detection {
     let processes = running_launcher_processes();
-    let modrinth_running = processes
-        .iter()
-        .any(|p| p.kind == LauncherKind::Modrinth);
 
     let mut launchers: Vec<LauncherInfo> = Vec::new();
     launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &PRISM));
@@ -38,15 +37,34 @@ pub fn detect_launchers(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> De
     launchers.extend(detect_mmc(manual_roots, known_roots, &processes, &MULTIMC));
     launchers.extend(detect_modrinth(manual_roots, known_roots, &processes));
     launchers.extend(detect_tlauncher(manual_roots, known_roots));
+    let legacy = detect_legacy(manual_roots, known_roots);
+    let official = detect_official(manual_roots, known_roots);
+    launchers.extend(legacy.iter().cloned());
+    launchers.extend(official.iter().cloned());
+
+// Папки, которые уже заняты карточками Legacy/официального лаунчера:
+    // ручной путь в них не должен превращаться в ещё одну карточку «вручную».
+    let claimed: Vec<PathBuf> = legacy
+        .iter()
+        .map(|l| l.data_dir.clone())
+        .chain(official.iter().map(|l| l.data_dir.clone()))
+        .collect();
 
     for root in manual_roots {
         if is_any_mmc_data_dir(root) || is_modrinth_data_dir(root) {
             continue; // уже покрыты выше
         }
-        if crate::adapters::tlauncher::is_tlauncher_data_dir(root) {
-            continue; // корень TLauncher — отдельная карточка
+        // `.minecraft` общий у TLauncher и официального лаунчера, а папка игры
+        // Legacy лежит внутри `.tlauncher`. Владелец один: кто специфичнее по
+        // маркерам, тот и забирает корень (иначе одна папка дала бы две
+        // карточки-дубля).
+        if is_tlauncher_data_dir(root)
+            || is_official_data_dir(root)
+            || claimed.iter().any(|d| d == root)
+        {
+            continue;
         }
-        if let Some(target) = manual_target(root) {
+if let Some(target) = manual_target(root) {
             launchers.push(LauncherInfo {
                 kind: LauncherKind::Manual,
                 display_name: format!("Папка: {}", target.name),
@@ -54,14 +72,37 @@ pub fn detect_launchers(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> De
                 data_dir: root.clone(),
                 portable: false,
                 targets: vec![target],
+                app_found: true,
             });
         }
     }
 
+    let extra: [(LauncherKind, bool); 2] = [
+        (
+            LauncherKind::Tlauncher,
+            crate::adapters::tlauncher::tlauncher_running(),
+        ),
+        (
+            LauncherKind::Legacy,
+            crate::adapters::legacy::legacy_running(),
+        ),
+    ];
+    let mut running: Vec<LauncherKind> = processes
+        .iter()
+        .map(|p| p.kind)
+        .chain(
+            extra
+                .into_iter()
+                .filter(|(_, is_running)| *is_running)
+                .map(|(kind, _)| kind),
+        )
+        .collect();
+    running.sort_by_key(|k| format!("{k:?}"));
+    running.dedup();
+
     Detection {
         launchers,
-        modrinth_running,
-        tlauncher_running: crate::adapters::tlauncher::tlauncher_running(),
+        running,
     }
 }
 
@@ -133,7 +174,7 @@ fn mmc_family(kind: LauncherKind) -> &'static MmcFamily {
         LauncherKind::Pinecone => &PINECONE,
         LauncherKind::Polymc => &POLYMC,
         LauncherKind::Multimc => &MULTIMC,
-        LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher => {
+        LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
             panic!("not an MMC-family launcher")
         }
     }
@@ -199,19 +240,23 @@ fn detect_mmc(
         }
     }
 
-    dedup_roots(roots)
+dedup_roots(roots)
         .into_iter()
-        .map(|r| LauncherInfo {
-            kind: fam.kind,
-            display_name: if r.portable {
-                format!("{} (портативный)", fam.display)
-            } else {
-                fam.display.to_string()
-            },
-            exe_path: r.exe,
-            targets: enumerate_mmc_targets(&r.dir, fam.kind),
-            data_dir: r.dir,
-            portable: r.portable,
+        .map(|r| {
+            let exe = r.exe.or_else(|| mmc_exe_next_to_data(&r.dir, fam));
+            LauncherInfo {
+                kind: fam.kind,
+                display_name: if r.portable {
+                    format!("{} (портативный)", fam.display)
+                } else {
+                    fam.display.to_string()
+                },
+                app_found: app_installed(fam.kind, exe.as_deref()),
+                exe_path: exe,
+                targets: enumerate_mmc_targets(&r.dir, fam.kind),
+                data_dir: r.dir,
+                portable: r.portable,
+            }
         })
         .collect()
 }
@@ -267,21 +312,91 @@ fn detect_modrinth(
         }
     }
 
-    dedup_roots(roots)
+dedup_roots(roots)
         .into_iter()
-        .map(|r| LauncherInfo {
-            kind: LauncherKind::Modrinth,
-            display_name: if r.portable {
-                "Modrinth App (портативный)".to_string()
-            } else {
-                "Modrinth App".to_string()
-            },
-            exe_path: r.exe,
-            targets: read_modrinth_targets(&r.dir).unwrap_or_default(),
-            data_dir: r.dir,
-            portable: r.portable,
+        .map(|r| {
+            // Портативная сборка Modrinth: exe рядом с папкой данных.
+            let exe = r.exe.or_else(|| {
+                std::fs::read_dir(&r.dir)
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .map(|e| e.path())
+                            .find(|p| is_modrinth_exe(p))
+                    })
+                    .ok()
+                    .flatten()
+            });
+            LauncherInfo {
+                kind: LauncherKind::Modrinth,
+                display_name: if r.portable {
+                    "Modrinth App (портативный)".to_string()
+                } else {
+                    "Modrinth App".to_string()
+                },
+                app_found: app_installed(LauncherKind::Modrinth, exe.as_deref()),
+                exe_path: exe,
+                targets: read_modrinth_targets(&r.dir).unwrap_or_default(),
+                data_dir: r.dir,
+                portable: r.portable,
+            }
         })
         .collect()
+}
+
+/// Кажется ли приложение установленным: exe на месте, процесс запущен или
+/// есть запись в реестре установленных программ.
+///
+/// Реестр — единственный честный признак «стоял и удалён»: папка с данными
+/// после удаления остаётся, и по ней отличить установленное приложение от
+/// брошенной папки нельзя. Но у портативных сборок (MultiMC, TLauncher
+/// portable) записи в реестре нет никогда — поэтому отсутствие записи сама
+/// по себе ничего не доказывает, и такие лаунчеры мы не прячем.
+#[cfg(windows)]
+fn registered_in_windows(fragments: &[&str]) -> bool {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY};
+    use winreg::RegKey;
+    for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+        let Ok(uninstall) = RegKey::predef(root)
+            .open_subkey_with_flags("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall", KEY_READ | KEY_WOW64_64KEY)
+        else {
+            continue;
+        };
+        for name in uninstall.enum_keys().flatten() {
+            let Ok(sub) = uninstall.open_subkey(name) else {
+                continue;
+            };
+            let display: String = sub.get_value("DisplayName").unwrap_or_default();
+            let lower = display.to_lowercase();
+            if fragments.iter().any(|f| lower.contains(&f.to_lowercase())) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn registered_in_windows(_fragments: &[&str]) -> bool {
+    false
+}
+
+/// Признак установленного приложения для карточки лаунчера.
+fn app_installed(kind: LauncherKind, exe: Option<&Path>) -> bool {
+    if exe.is_some_and(|p| p.is_file()) {
+        return true;
+    }
+    let fragments: &[&str] = match kind {
+        LauncherKind::Prism => &["prism launcher"],
+        LauncherKind::Pinecone => &["pinecone", "elyprism"],
+        LauncherKind::Polymc => &["polymc"],
+        LauncherKind::Multimc => &["multimc"],
+        LauncherKind::Modrinth => &["modrinth"],
+        LauncherKind::Tlauncher => &["tlauncher"],
+        LauncherKind::Legacy => &["legacy launcher"],
+        LauncherKind::Official => &["minecraft launcher"],
+        LauncherKind::Manual => &[],
+    };
+    !fragments.is_empty() && registered_in_windows(fragments)
 }
 
 /// Сбор корней TLauncher: дефолтный `.minecraft` + `minecraft.gamedir`
@@ -332,7 +447,7 @@ fn detect_tlauncher(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<La
         }
     }
 
-    dedup_roots(roots)
+dedup_roots(roots)
         .into_iter()
         .map(|r| {
             let exe = r.exe.or_else(|| tl::find_tlauncher_exe(&r.dir));
@@ -343,13 +458,134 @@ fn detect_tlauncher(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<La
                 } else {
                     "TLauncher".to_string()
                 },
+                app_found: exe.is_some(),
                 exe_path: exe,
-                targets: tl::enumerate_tlauncher_targets(&r.dir),
+                targets: tl::enumerate_targets(&r.dir),
                 data_dir: r.dir,
                 portable: r.portable,
             }
         })
         .collect()
+}
+
+/// Сбор корней Legacy Launcher: папки установки лаунчера (где лежит
+/// `LL.exe` и `tl.properties`), из них берётся `minecraft.gamedir` — папка
+/// игры. Инстансов нет: цели перечисляются из `versions/` при сборке карточки,
+/// а `path` цели — подпапка выбранного в лаунчере режима.
+fn detect_legacy(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
+    use crate::adapters::legacy as lg;
+    let mut install_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(roaming) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        install_dirs.extend(lg::known_install_dirs(&roaming));
+    }
+    install_dirs.extend(
+        manual_roots
+            .iter()
+            .chain(known_roots.iter())
+            .filter(|p| lg::is_install_dir(p))
+            .cloned(),
+    );
+let mut seen: std::collections::BTreeSet<PathBuf> = Default::default();
+
+    let mut out: Vec<LauncherInfo> = Vec::new();
+    for install in install_dirs {
+        let Some(config) = lg::LegacyConfig::load(&install) else {
+            continue; // конфига нет/битый — лаунчер сюда не настроен
+        };
+        let key = install.canonicalize().unwrap_or_else(|_| install.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        let exe = install.join(lg::exe_name());
+        out.push(LauncherInfo {
+            kind: LauncherKind::Legacy,
+            display_name: "Legacy Launcher".to_string(),
+            app_found: exe.is_file() || app_installed(LauncherKind::Legacy, Some(&exe)),
+            exe_path: Some(exe),
+            targets: lg::enumerate_targets(&config),
+            data_dir: config.game_dir,
+            portable: false,
+        });
+    }
+    out
+}
+
+/// Кому принадлежит папка игровых данных. Маркеры специфичны в этом
+/// порядке: TLauncher (его exe лежит прямо в папке) → Legacy (папка
+/// установки лаунчера с `tl.properties`/`LL.exe`) → официальный лаунчер.
+/// Одна папка отдаёт ровно одну карточку, иначе пользователь видит
+/// «Minecraft Launcher», у которого на самом деле чужие данные.
+fn data_dir_owner(dir: &Path) -> Option<LauncherKind> {
+    if is_tlauncher_data_dir(dir) {
+        return Some(LauncherKind::Tlauncher);
+    }
+    if crate::adapters::legacy::is_game_dir_of_launcher(dir) {
+        return Some(LauncherKind::Legacy);
+    }
+    if is_official_data_dir(dir) {
+        return Some(LauncherKind::Official);
+    }
+    None
+}
+
+/// Сбор корней официального Minecraft Launcher: `%APPDATA%\.minecraft`.
+/// Store-сборка лежит в `WindowsApps` и для прямого запуска закрыта, поэтому
+/// exe тут нужен только для старой Standalone-сборки; Store поднимаем по AUMID.
+fn detect_official(manual_roots: &[PathBuf], known_roots: &[PathBuf]) -> Vec<LauncherInfo> {
+    let mut roots: Vec<DataRoot> = Vec::new();
+    if let Some(roaming) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        let def = crate::adapters::official::default_data_dir(&roaming);
+        if is_official_data_dir(&def) {
+            roots.push(DataRoot {
+                exe: official_exe(),
+                dir: def,
+                portable: false,
+            });
+        }
+    }
+    for root in manual_roots.iter().chain(known_roots.iter()) {
+        if is_official_data_dir(root) && data_dir_owner(root) == Some(LauncherKind::Official) {
+            roots.push(DataRoot {
+                exe: official_exe(),
+                dir: root.clone(),
+                portable: false,
+            });
+        }
+    }
+    dedup_roots(roots)
+        .into_iter()
+        .map(|r| {
+            let app_found = r.exe.is_some() || crate::adapters::official::store_app_installed();
+            LauncherInfo {
+                kind: LauncherKind::Official,
+                display_name: "Minecraft Launcher".to_string(),
+                exe_path: r.exe,
+                targets: crate::adapters::official::enumerate_targets(&r.dir),
+                data_dir: r.dir,
+                portable: r.portable,
+                app_found,
+            }
+        })
+        .collect()
+}
+
+/// Корень данных официального лаунчера (`%APPDATA%\.minecraft`).
+fn is_official_data_dir(p: &Path) -> bool {
+    crate::adapters::official::is_data_dir(p)
+}
+
+/// Exe Standalone-сборки официального лаунчера. Store-сборки здесь нет и
+/// быть не может: она в закрытой `WindowsApps`, её поднимают по AUMID.
+fn official_exe() -> Option<PathBuf> {
+    [
+        std::env::var_os("ProgramFiles(x86)").map(PathBuf::from),
+        std::env::var_os("ProgramFiles").map(PathBuf::from),
+        dirs::data_local_dir().map(|p| p.join("Programs")),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|base| base.join("Minecraft Launcher").join("MinecraftLauncher.exe"))
+    .find(|c| c.is_file())
 }
 
 /// Exe TLauncher (`TLauncher*.exe`, регистронезависимо).
@@ -366,14 +602,8 @@ fn is_tlauncher_exe(p: &Path) -> bool {
 fn known_tlauncher_data_root() -> Option<PathBuf> {
     // 1. Явный game dir из конфига запущенного/настроенного лаунчера.
     if let Some(roaming) = std::env::var_os("APPDATA").map(PathBuf::from) {
-        let props = roaming.join(".tlauncher").join("tlauncher-2.0.properties");
-        if let Ok(text) = std::fs::read_to_string(&props) {
-            let parsed = crate::adapters::tlauncher::parse_tlauncher_properties(&text);
-            if let Some(dir) = parsed.game_dir {
-                if crate::adapters::tlauncher::is_tlauncher_data_dir(&dir) {
-                    return Some(dir);
-                }
-            }
+        if let Some(dir) = crate::adapters::tlauncher::game_dir_from_props(&roaming) {
+            return Some(dir);
         }
         // 2. Дефолт.
         let def = roaming.join(".minecraft");
@@ -427,9 +657,14 @@ pub(crate) fn running_launcher_processes() -> Vec<RunningLauncher> {
 }
 
 /// Вид процесса по имени exe: Prism-семейство — по префиксам, Modrinth — по
-/// именам, TLauncher — java-процессы, чей exe лежит под `.tlauncher`
-/// (лаунчер; игра — из Mojang-рантайма, её не трогаем). Единая точка для
-/// детекта запущенных и закрытия.
+/// именам, TLauncher и Legacy Launcher — java-процессы (их лаунчеры написаны
+/// на Java), официальный лаунчер — `Minecraft.exe` из Store-пакета.
+/// Единая точка для детекта запущенных и закрытия.
+///
+/// Про официальный лаунчер: имя `Minecraft.exe` само по себе ничего не значит
+/// (так называется и Bedrock-игра), поэтому решает только пакет в пути —
+/// `Microsoft.4297127D64EC6`. Игровые процессы там тоже `Minecraft.exe`, но
+/// из другого пакета, и в выборку они не попадают.
 fn process_kind(proc: &sysinfo::Process) -> Option<LauncherKind> {
     let name = proc.name().to_string_lossy().to_lowercase();
     let stem = name.strip_suffix(".exe").unwrap_or(&name);
@@ -442,14 +677,41 @@ fn process_kind(proc: &sysinfo::Process) -> Option<LauncherKind> {
     if name == "modrinth app.exe" || name == "modrinthapp.exe" || name == "modrinth-app" {
         return Some(LauncherKind::Modrinth);
     }
-    if (name == "java.exe" || name == "javaw.exe" || name == "java")
-        && proc
-            .exe()
-            .is_some_and(|e| e.to_string_lossy().to_lowercase().contains(".tlauncher"))
-    {
+    if name == "minecraft.exe" && is_store_launcher_process(proc.exe()) {
+        return Some(LauncherKind::Official);
+    }
+    let exe = proc.exe();
+    if crate::adapters::tlauncher::is_launcher_process(exe) {
         return Some(LauncherKind::Tlauncher);
     }
+    if crate::adapters::legacy::is_install_process(exe) {
+        return Some(LauncherKind::Legacy);
+    }
     None
+}
+
+/// Процесс официального лаунчера — `Minecraft.exe` из папки, где рядом лежит
+/// `gamelaunchhelper.exe`.
+///
+/// По одному имени файла нельзя: `Minecraft.exe` называется и у Bedrock.
+/// По пути тоже: настоящую папку Store-пакета заранее не узнать — в реестре
+/// лежит виртуальная `C:\Program Files\WindowsApps\…`, а процесс сообщает
+/// реальный диск (проверено вживую: `D:\XboxGames\Minecraft Launcher\Content\
+/// Minecraft.exe`, потому что приложения ставятся на D:). Поэтому опознаём по
+/// содержимому папки: у лаунчера рядом с exe есть `gamelaunchhelper.exe`.
+/// Проверка локальная и дешёвая, а не «доверимся имени пакета».
+fn is_store_launcher_process(exe: Option<&Path>) -> bool {
+    let Some(exe) = exe else {
+        return false;
+    };
+    if !exe
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("minecraft.exe"))
+    {
+        return false;
+    }
+    exe.parent()
+        .is_some_and(|dir| dir.join("gamelaunchhelper.exe").is_file())
 }
 
 /// Аккуратно закрывает лаунчер перед установкой: просит процессы завершиться
@@ -575,7 +837,7 @@ fn known_mmc_exe(fam: &MmcFamily) -> Vec<PathBuf> {
             // У MultiMC штатного установщика нет — только портативка, её ловят
             // процессы/ярлыки/PATH/ручные корни.
             LauncherKind::Multimc => {}
-            LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher => {}
+            LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {}
         }
     }
     #[cfg(not(windows))]
@@ -672,7 +934,7 @@ fn data_root_next_to_exe(exe: &Path, kind: LauncherKind) -> Option<PathBuf> {
         }
         LauncherKind::Modrinth => is_modrinth_data_dir(dir),
         // Ручная папка и TLauncher разбираются отдельно (см. ниже).
-        LauncherKind::Manual | LauncherKind::Tlauncher => false,
+        LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => false,
     };
     let dir = exe.parent()?;
     if is_data(dir) {
@@ -844,6 +1106,22 @@ fn is_mmc_exe(p: &Path, fam: &MmcFamily) -> bool {
             let lower = n.to_string_lossy().to_lowercase();
             fam.exe_prefixes.iter().any(|prefix| lower.starts_with(prefix))
         })
+}
+
+/// Exe портативной сборки лежит рядом с папкой данных (`MultiMC.exe` +
+/// `instances/` в одной папке). Без этой проверки портативный MultiMC в
+/// нестандартном месте выглядел бы как «приложение удалено».
+fn mmc_exe_next_to_data(dir: &Path, fam: &MmcFamily) -> Option<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| is_mmc_exe(p, fam))
+        .collect();
+    found.sort();
+    found.into_iter().next()
 }
 
 fn is_modrinth_exe(p: &Path) -> bool {
@@ -1121,6 +1399,36 @@ mod tests {
 
     fn fabric_instance_cfg(name: &str) -> String {
         format!("ConfigVersion=1.3\nInstanceType=OneSix\nManagedPack=false\nname={name}\n")
+    }
+
+    /// Регрессия: лаунчер искался по подстроке имени пакета в пути, а реальный
+    /// путь у Store-сборки другой диск (`D:\XboxGames\…`) — и сверху имя
+    /// файла, у Bedrock совпадающее. Теперь опознаём по `gamelaunchhelper.exe`
+    /// рядом с exe.
+    #[test]
+    fn store_launcher_process_needs_the_helper_beside_the_exe() {
+        let root = temp_root("store-proc");
+        let content = root.join("Minecraft Launcher").join("Content");
+        std::fs::create_dir_all(&content).expect("mkdir");
+        std::fs::write(content.join("Minecraft.exe"), b"x").expect("exe");
+        std::fs::write(content.join("gamelaunchhelper.exe"), b"x").expect("helper");
+
+        assert!(is_store_launcher_process(Some(&content.join("Minecraft.exe"))));
+
+        // Bedrock: тот же `Minecraft.exe`, но помощника лаунчера рядом нет.
+        let bedrock = root.join("MinecraftUWP").join("Content");
+        std::fs::create_dir_all(&bedrock).expect("mkdir");
+        std::fs::write(bedrock.join("Minecraft.exe"), b"x").expect("exe");
+        assert!(!is_store_launcher_process(Some(&bedrock.join("Minecraft.exe"))));
+
+        // Помощник есть, но имя exe чужое.
+        assert!(!is_store_launcher_process(Some(
+            &content.join("gamelaunchhelper.exe")
+        )));
+        assert!(!is_store_launcher_process(Some(
+            &content.join("Minecraft.Windows.exe")
+        )));
+        assert!(!is_store_launcher_process(None));
     }
 
     fn mmc_pack(mc: &str, loader_uid: Option<(&str, &str)>) -> String {
@@ -1482,5 +1790,38 @@ mod tests {
                 .all(|l| !(l.kind == LauncherKind::Manual && l.data_dir == root))
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+    /// Живой прогон детекта по реальной машине. Не в обычном прогоне: читает
+    /// настоящие `%APPDATA%` и системные процессы. Запуск: `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "живой прогон по системе; запускается вручную"]
+    fn live_detection_smoke() {
+        let d = detect_launchers(&[], &[]);
+        println!("запущены: {:?}", d.running);
+        for l in &d.launchers {
+            println!(
+                "{:?} | {} | exe={:?} | app_found={} | целей={} | data_dir={}",
+                l.kind,
+                l.display_name,
+                l.exe_path,
+                l.app_found,
+                l.targets.len(),
+                l.data_dir.display()
+            );
+            for t in l.targets.iter().take(6) {
+                println!(
+                    "    - {} (mc {}, {:?}{}) -> {}",
+                    t.name,
+                    t.minecraft_version,
+                    t.loader,
+                    t.loader_version
+                        .as_ref()
+                        .map(|v| format!(" {v}"))
+                        .unwrap_or_default(),
+                    t.path.display()
+                );
+            }
+        }
+        assert!(d.launchers.iter().any(|l| l.kind == LauncherKind::Official));
     }
 }

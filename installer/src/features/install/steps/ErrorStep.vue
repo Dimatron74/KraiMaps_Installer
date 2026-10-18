@@ -30,6 +30,7 @@ function back() {
       :message="store.error.message"
       :details="store.error.details"
       :hint="store.error.hint"
+      :action="store.error.action"
     />
     <div class="mt-5 flex gap-2">
       <Btn variant="secondary" @click="back()">Назад</Btn>

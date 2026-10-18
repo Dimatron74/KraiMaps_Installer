@@ -1,10 +1,13 @@
 <script setup lang="ts">
-import { useInstallStore } from '../../../app/stores/install';
+import { useInstallStore, VERSION_LAUNCHERS } from '../../../app/stores/install';
+import type { LauncherKind } from '../../../shared/types/installer';
 import { LOADER_NAMES } from '../../../shared/types/installer';
 import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
 
 const store = useInstallStore();
+
+const isVersionLauncher = (kind: LauncherKind) => VERSION_LAUNCHERS.includes(kind);
 </script>
 
 <template>
@@ -44,13 +47,22 @@ const store = useInstallStore();
         :disabled="store.busy"
         @click="store.createNewTarget()"
       >
-        <template v-if="store.launcher?.kind === 'tlauncher' && store.pack?.is_modded">
+        <template v-if="isVersionLauncher(store.launcher?.kind ?? 'manual') && store.pack?.is_modded">
           <p class="text-sm font-semibold text-primary-400">
             Установить версию «{{ store.pack?.world_version }} · {{ store.pack ? LOADER_NAMES[store.pack.loader] : '' }}»
           </p>
           <p class="mt-1 text-xs text-secondary">
             Скачаем официальный установщик и подготовим версию с пометкой [KK]. Ничего нажимать не нужно.
             Если в общих mods/ есть моды, они будут заменены модами карты (старые сохраним в бэкап).
+          </p>
+        </template>
+        <template v-else-if="store.launcher?.kind === 'official'">
+          <p class="text-sm font-semibold text-primary-400">
+            Создать установку «{{ store.pack?.world_name }}»
+          </p>
+          <p class="mt-1 text-xs text-secondary">
+            Своя папка игры под карту — ваши установки и миры не пострадают.
+            После установки мир появится в панели быстрого запуска.
           </p>
         </template>
         <template v-else>

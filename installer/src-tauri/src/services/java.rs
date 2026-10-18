@@ -1,15 +1,46 @@
-//! Поиск подходящей Java для прогона установщиков загрузчиков.
+﻿//! Поиск подходящей Java для прогона установщиков загрузчиков.
+//!
+//! Где именно лежит Java — **свойство дистрибуции лаунчера**, а не единая
+//! договорённость. Standalone-лаунчер кладёт рантаймы в `<game_dir>/runtime`,
+//! а Store-сборка — в `%LOCALAPPDATA%\Packages\<PFN>\LocalCache\Local\runtime`,
+//! и эти пути не пересекаются. Поэтому корни задаёт вызывающий адаптер
+//! ([`JavaRoots`]), а не этот модуль: иначе «однажды настроенный» путь молча
+//! перестаёт работать на другой сборке того же лаунчера.
 //!
 //! Цепочка (без действий пользователя):
-//! 1. Mojang-рантаймы в `<game_dir>/runtime` (их докачивает сам лаунчер);
+//! 1. рантаймы самого лаунчера — совместимы с его версиями игры, приоритет
+//!    выше системной;
 //! 2. системная Java (`PATH`, `JAVA_HOME`);
-//! 3. JRE из комплекта TLauncher (последний шанс; TLS у него капризный,
-//!    см. мини-spike: дефолтный trust init падает, keystore при этом цел).
+//! 3. Java из комплекта лаунчера (`starter/*` у TLauncher, `jre/<arch>` у
+//!    Legacy Launcher).
+//!
+//! Каждый кандидат проверяется запуском `java -version` ([`java_major`]),
+//! поэтому в выборку попадают только реально рабочие JVM.
 //! Старым Forge (`mc <= 1.16`) лучше Java 8–16 — новые JVM их часто роняют.
 
 use crate::domain::{InstallError, LoaderKind};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Где искать Java для конкретного лаунчера. Адаптер знает раскладку своей
+/// дистрибуции и заполняет поля сам; ничего не зашито здесь.
+#[derive(Debug, Default, Clone)]
+pub struct JavaRoots {
+    /// Рантаймы, которые докачивает сам лаунчер (Mojang). Приоритет выше
+    /// системной: они гарантированно совместимы с его версиями игры.
+    pub mojang: Vec<PathBuf>,
+    /// Java из комплекта лаунчера: TLauncher `starter`, Legacy `jre/<arch>`.
+    pub bundled: Vec<PathBuf>,
+}
+
+/// Глубины обхода. 6 покрывает вложенность Store-рантайма
+/// (`runtime/java-runtime-delta/windows-x64/java-runtime-delta/bin/java.exe`),
+/// 5 — комплекты лаунчеров. Это bounded-обход известных корней, не скан диска.
+const MOJANG_RUNTIME_DEPTH: usize = 6;
+const BUNDLED_JAVA_DEPTH: usize = 5;
+
+/// Максимум корней в диагностике `NoJava`: список — для человека, а не лог.
+const MAX_REPORTED_ROOTS: usize = 6;
 
 /// Кандидат: путь к `java(.exe)` + мажорная версия + источник.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +54,8 @@ pub struct JavaCandidate {
 pub enum JavaSource {
     MojangRuntime,
     System,
-    TlauncherBundled,
+    /// Комплект лаунчера: TLauncher / Legacy Launcher / Store-лаунчер.
+    Bundled,
 }
 
 /// Требование к Java: минимальная мажорная версия; для старых Forge —
@@ -142,32 +174,36 @@ pub fn java_major(exe: &Path) -> Option<u64> {
     parse_java_major(&text)
 }
 
-/// Mojang-рантаймы под game dir: `<runtime>/**/bin/java(.exe)`, строго
-/// bounded (глубина 5, без full-disk scan — только известный корень).
-fn discover_mojang_runtimes(game_dir: &Path) -> Vec<PathBuf> {
-    let root = game_dir.join("runtime");
+/// Java в заданных корнях: `**/bin/java(.exe)`, строго bounded — только
+/// переданные корни, никакого полного сканирования диска.
+fn discover_java_in(roots: &[PathBuf], max_depth: usize) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for entry in walkdir::WalkDir::new(&root)
-        .max_depth(5)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|e| e.ok())
-    {
-        if !entry.file_type().is_file() {
+    for root in roots {
+        if !root.is_dir() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().to_lowercase();
-        if name != "java.exe" && name != "java" && name != "javaw.exe" {
-            continue;
-        }
-        // Только `.../bin/java(.exe)`: мусор с тем же именем не ловим.
-        let is_in_bin = entry
-            .path()
-            .parent()
-            .and_then(|p| p.file_name())
-            .is_some_and(|n| n.eq_ignore_ascii_case("bin"));
-        if is_in_bin {
-            out.push(entry.path().to_path_buf());
+        for entry in walkdir::WalkDir::new(root)
+            .max_depth(max_depth)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if name != "java.exe" && name != "java" && name != "javaw.exe" {
+                continue;
+            }
+            // Только `.../bin/java(.exe)`: мусор с тем же именем не ловим.
+            if entry
+                .path()
+                .parent()
+                .and_then(|p| p.file_name())
+                .is_some_and(|n| n.eq_ignore_ascii_case("bin"))
+            {
+                out.push(entry.path().to_path_buf());
+            }
         }
     }
     out.sort();
@@ -201,95 +237,78 @@ fn discover_system_java() -> Vec<PathBuf> {
     out
 }
 
-/// JRE из комплекта TLauncher: `<roaming>/.tlauncher/starter/*/bin/java(.exe)`.
-/// Один уровень вглубь (`jre_default` и т.п.), без рекурсии.
-fn discover_tlauncher_java(roaming: &Path) -> Vec<PathBuf> {
-    let starter = roaming.join(".tlauncher").join("starter");
-    let mut out = Vec::new();
-    let entries = std::fs::read_dir(&starter).map(|r| r.collect::<Vec<_>>());
-    for entry in entries.unwrap_or_default().into_iter().filter_map(|e| e.ok()) {
-        let dir = entry.path();
-        if !dir.is_dir() {
-            continue;
-        }
-        // JRE лежит либо прямо в подпапке starter, либо на уровень глубже
-        // (`jre_default/jre-21...-windows-x64/bin/java.exe`).
-        for bin in [dir.join("bin")] {
-            for name in ["java.exe", "java"] {
-                let c = bin.join(name);
-                if c.is_file() {
-                    out.push(c);
-                }
-            }
-        }
-        if let Ok(inner) = std::fs::read_dir(&dir) {
-            for sub in inner.filter_map(|e| e.ok()).map(|e| e.path()) {
-                if !sub.is_dir() {
-                    continue;
-                }
-                for name in ["java.exe", "java"] {
-                    let c = sub.join("bin").join(name);
-                    if c.is_file() {
-                        out.push(c);
-                    }
-                }
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
+/// Java из комплекта лаунчера: обход переданных корней.
+fn discover_bundled_java(roots: &[PathBuf]) -> Vec<PathBuf> {
+    discover_java_in(roots, BUNDLED_JAVA_DEPTH)
 }
 
-/// Полный поиск по цепочке. `roaming` — `%APPDATA%` (для комплекта TL).
-/// Возвращает путь подходящей Java или `NoJava`.
-pub fn resolve_java(
-    game_dir: &Path,
-    roaming: Option<&Path>,
-    req: &JavaReq,
-) -> Result<PathBuf, InstallError> {
-    let mut candidates = Vec::new();
-    for path in discover_mojang_runtimes(game_dir) {
+/// Диагностика для `NoJava`: чего не хватило, что нашли и где смотрели.
+/// Пользователь читает это в «Подробнее», поэтому конкретные пути ценнее
+/// перечисления категорий.
+fn no_java_report(candidates: &[JavaCandidate], roots: &JavaRoots, req: &JavaReq) -> String {
+    let mut report =
+        format!("нужна Java {}+ для подготовки версии игры", req.min_major);
+
+    let too_old: Vec<String> = candidates
+        .iter()
+        .filter(|c| c.major < req.min_major)
+        .map(|c| format!("Java {} ({})", c.major, c.path.display()))
+        .collect();
+    if !too_old.is_empty() {
+        report.push_str(&format!(
+            "; нашена, но старее нужной: {}",
+            too_old.join(", ")
+        ));
+    }
+
+    let probed: Vec<String> = roots
+        .mojang
+        .iter()
+        .chain(&roots.bundled)
+        .filter(|p| p.is_dir())
+        .take(MAX_REPORTED_ROOTS)
+        .map(|p| p.display().to_string())
+        .collect();
+    if probed.is_empty() {
+        report.push_str("; папок с рантаймами лаунчера не найдено");
+    } else {
+        report.push_str(&format!("; проверенные папки: {}", probed.join(", ")));
+    }
+    report.push_str("; системная Java: PATH и JAVA_HOME");
+    report
+}
+
+/// Полный поиск по цепочке. `roots` задаёт вызывающий адаптер — расположение
+/// рантаймов зависит от дистрибуции лаунчера. Возвращает путь подходящей
+/// Java или `NoJava` с диагностикой.
+pub fn resolve_java(roots: &JavaRoots, req: &JavaReq) -> Result<PathBuf, InstallError> {
+    let mut candidates: Vec<JavaCandidate> = Vec::new();
+    let push = |path: PathBuf, source: JavaSource, candidates: &mut Vec<JavaCandidate>| {
+        if candidates.iter().any(|c: &JavaCandidate| c.path == path) {
+            return;
+        }
+        // Кандидат в выборку попадает только если JVM реально стартует.
         if let Some(major) = java_major(&path) {
             candidates.push(JavaCandidate {
                 path,
                 major,
-                source: JavaSource::MojangRuntime,
+                source,
             });
         }
+    };
+
+    for path in discover_java_in(&roots.mojang, MOJANG_RUNTIME_DEPTH) {
+        push(path, JavaSource::MojangRuntime, &mut candidates);
     }
     for path in discover_system_java() {
-        if candidates.iter().any(|c: &JavaCandidate| c.path == path) {
-            continue;
-        }
-        if let Some(major) = java_major(&path) {
-            candidates.push(JavaCandidate {
-                path,
-                major,
-                source: JavaSource::System,
-            });
-        }
+        push(path, JavaSource::System, &mut candidates);
     }
-    if let Some(roaming) = roaming {
-        for path in discover_tlauncher_java(roaming) {
-            if candidates.iter().any(|c: &JavaCandidate| c.path == path) {
-                continue;
-            }
-            if let Some(major) = java_major(&path) {
-                candidates.push(JavaCandidate {
-                    path,
-                    major,
-                    source: JavaSource::TlauncherBundled,
-                });
-            }
-        }
+    for path in discover_bundled_java(&roots.bundled) {
+        push(path, JavaSource::Bundled, &mut candidates);
     }
-    pick_java(&candidates, req).ok_or_else(|| {
-        InstallError::NoJava(format!(
-            "нужна Java {}+ для подготовки версии, не найдена (проверены рантаймы игры, PATH/JAVA_HOME, комплект TLauncher)",
-            req.min_major
-        ))
-    })
+
+    pick_java(&candidates, req)
+        .ok_or_else(|| InstallError::NoJava(no_java_report(&candidates, roots, req)))
 }
 
 
@@ -393,13 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn tlauncher_bundled_is_last_resort() {
+    fn bundled_java_is_last_resort() {
         let req = JavaReq {
             min_major: 17,
             prefer_legacy: false,
         };
         let cands = vec![
-            cand(JavaSource::TlauncherBundled, 21),
+            cand(JavaSource::Bundled, 21),
             cand(JavaSource::System, 17),
         ];
         assert_eq!(
@@ -450,5 +469,81 @@ mod tests {
         assert!(mc_needs_java21("1.21.1"));
         assert!(mc_needs_java21("26.2"));
         assert!(!mc_needs_java21("1.16.5"));
+    }
+
+    /// Раскладка Store-рантайма глубже, чем у Standalone: считываем её
+    /// в глубину, иначе `java.exe` выпадает из обхода и мы возвращаемся к
+    /// той же ошибке, что чинили.
+    #[test]
+    fn finds_java_in_nested_mojang_runtime_layout() {
+        let root = std::env::temp_dir().join(format!("km-java-nested-{}", std::process::id()));
+        let runtime = root
+            .join("java-runtime-delta")
+            .join("windows-x64")
+            .join("java-runtime-delta");
+        std::fs::create_dir_all(runtime.join("bin")).expect("mkdir");
+        let bin = runtime.join("bin");
+        for name in ["java.exe", "javaw.exe"] {
+            std::fs::write(bin.join(name), b"not a real jvm").expect("write");
+        }
+        // Мусор с тем же именем вне `bin/` ловиться не должен.
+        std::fs::create_dir_all(runtime.join("other")).expect("mkdir");
+        std::fs::write(runtime.join("other").join("java.exe"), b"decoy").expect("write");
+
+        let found = discover_java_in(std::slice::from_ref(&root), MOJANG_RUNTIME_DEPTH);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            found,
+            vec![bin.join("java.exe"), bin.join("javaw.exe")],
+            "Store-раскладка должна находиться целиком, мусор вне bin — нет",
+        );
+    }
+
+    #[test]
+    fn missing_root_yields_no_candidates() {
+        let absent = std::env::temp_dir().join("km-java-definitely-absent-root");
+        assert!(discover_java_in(&[absent], MOJANG_RUNTIME_DEPTH).is_empty());
+    }
+
+    /// Диагностика обязана называть версию найденной, но слишком старой Java:
+    /// «не нашли Java» без версии бесполезно — пользователь не знает, что у
+    /// него уже стоит.
+    #[test]
+    fn no_java_report_names_too_old_candidates_and_probed_roots() {
+        let root = std::env::temp_dir().join(format!("km-java-report-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let candidates = vec![JavaCandidate {
+            path: PathBuf::from("C:/Program Files/Java/jre1.8.0_461/bin/java.exe"),
+            major: 8,
+            source: JavaSource::System,
+        }];
+        let roots = JavaRoots {
+            mojang: vec![root.clone(), root.join("absent")],
+            bundled: Vec::new(),
+        };
+        let req = JavaReq {
+            min_major: 17,
+            prefer_legacy: false,
+        };
+        let report = no_java_report(&candidates, &roots, &req);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(report.contains("Java 17+"), "{report}");
+        assert!(report.contains("Java 8"), "назван найденный старый: {report}");
+        assert!(report.contains("jre1.8.0_461"), "назван путь: {report}");
+        assert!(report.contains(&root.display().to_string()), "назван корень: {report}");
+        assert!(!report.contains("absent"), "несуществующие корни не вводят в заблуждение: {report}");
+    }
+
+    #[test]
+    fn no_java_report_says_when_no_runtime_folders_exist() {
+        let roots = JavaRoots::default();
+        let req = JavaReq {
+            min_major: 17,
+            prefer_legacy: false,
+        };
+        let report = no_java_report(&[], &roots, &req);
+        assert!(report.contains("рантаймами"), "{report}");
     }
 }

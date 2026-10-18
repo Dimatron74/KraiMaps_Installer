@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { open } from '@tauri-apps/plugin-dialog';
-import { useInstallStore } from '../../../app/stores/install';
+import { useInstallStore, VERSION_LAUNCHERS } from '../../../app/stores/install';
 import { api } from '../../../shared/api/commands';
 import { LAUNCHER_NAMES } from '../../../shared/types/installer';
 import Alert from '../../../shared/ui/Alert.vue';
@@ -61,12 +61,16 @@ async function pickManualFolder() {
         </p>
         <p class="mt-0.5 truncate font-mono text-[11px] text-tertiary">{{ l.data_dir }}</p>
         <p class="mt-1 text-xs text-secondary">
-          <template v-if="l.kind === 'tlauncher'">
+          <template v-if="VERSION_LAUNCHERS.includes(l.kind)">
             {{ l.targets.length === 0 ? 'Версий пока нет — установим нужную' : `Версий: ${l.targets.length}` }}
           </template>
           <template v-else>
             {{ l.targets.length === 0 ? 'Инстансов пока нет — создадим новый' : `Инстансов: ${l.targets.length}` }}
           </template>
+        </p>
+        <p v-if="!l.app_found" class="mt-1 text-xs text-tertiary">
+          Приложение не найдено — осталась только папка с данными. Карту поставить можно, но запустить
+          лаунчер отсюда не выйдет.
         </p>
       </button>
     </div>

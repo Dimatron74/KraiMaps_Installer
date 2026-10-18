@@ -45,11 +45,11 @@ function goHome() {
       </p>
     </Alert>
 
-    <Alert v-if="store.tlauncherNote" tone="warning" class="mt-4 max-w-md text-left">
-      <p class="text-xs">{{ store.tlauncherNote }}</p>
+    <Alert v-if="store.versionNote" tone="warning" class="mt-4 max-w-md text-left">
+      <p class="text-xs">{{ store.versionNote }}</p>
     </Alert>
 
-    <div class="mt-6 flex w-full max-w-md flex-col gap-2">
+<div class="mt-6 flex w-full max-w-md flex-col gap-2">
       <Btn
         v-if="store.target?.launcher === 'manual'"
         variant="success"
@@ -57,12 +57,20 @@ function goHome() {
         :loading="store.busy"
         @click="store.play()"
       >
-        Открыть папку с миром
+        Открыть папку
       </Btn>
-      <Btn v-else variant="success" size="lg" :loading="store.busy" @click="store.play()">
-        Играть
-      </Btn>
-      <Btn variant="secondary" @click="goHome()">На главную</Btn>
+      <template v-else-if="store.launcher?.app_found">
+        <Btn variant="success" size="lg" :loading="store.busy" @click="store.play()">
+          Играть
+        </Btn>
+      </template>
+      <Alert v-else tone="info">
+        <p class="text-xs">
+          Лаунчер не найден — осталась только папка с данными. Карта установлена, но запустить её отсюда
+          не получится.
+        </p>
+      </Alert>
+      <Btn variant="secondary" @click="goHome()">В установки</Btn>
     </div>
   </div>
 </template>

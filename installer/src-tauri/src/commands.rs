@@ -1,16 +1,16 @@
-//! Tauri-команды: тонкий мост между движком (`services`/`adapters`)
+﻿//! Tauri-команды: тонкий мост между движком (`services`/`adapters`)
 //! и фронтендом. Никакой логики здесь нет — только сериализация,
 //! `spawn_blocking` для тяжёлых файловых операций и проброс прогресса
 //! в событие `deploy-progress`. Ошибки — объектом
 //! `{code, message, details}` (код `E_*` для «Подробнее»).
 
-use crate::adapters::{manual, modrinth, prism, tlauncher};
+use crate::adapters::{legacy, manual, modrinth, official, prism, tlauncher, vanilla};
 use crate::domain::{
     GameTarget, InstallError, LauncherKind, LoaderKind, PackAnalysis,
 };
 use crate::services::{auth, deploy, detect, download, normalize, site, update_policy, versions};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::Emitter;
 
 #[derive(Debug, Serialize)]
@@ -125,9 +125,11 @@ pub async fn create_instance(
             icon_path.as_deref(),
         ),
         LauncherKind::Manual => Err(InstallError::NoLauncher),
-        // У TLauncher нет инстансов: версии готовятся командой
-        // `ensure_tlauncher_version`, сюда фронт не ходит.
-        LauncherKind::Tlauncher => Err(InstallError::NoLauncher),
+        // У TLauncher и Legacy Launcher нет инстансов: версии готовятся
+        // командами `ensure_tlauncher_version` / `ensure_legacy_version`.
+        LauncherKind::Tlauncher | LauncherKind::Legacy => Err(InstallError::NoLauncher),
+        // У официального лаунчера своя модель (Установки) — отдельная команда.
+        LauncherKind::Official => Err(InstallError::NoLauncher),
     })
     .await?
     .map_err(CmdError::from)
@@ -146,12 +148,25 @@ pub async fn close_launcher(launcher: LauncherKind) -> bool {
 /// Открывает лаунчер после установки (только если был запущен на старте —
 /// это решает фронт по флагу `close_launcher`). Ошибка (нет exe, не
 /// стартует) — в `CmdError`, фронт её глотает молча: установка уже успешна.
+///
+/// Вид запуска зависит от лаунчера, а не только от exe: у Store-сборки
+/// официального лаунчера exe нет вовсе (`WindowsApps` закрыт для обычного
+/// приложения), и открывать её можно только по AUMID. Список exe в этом
+/// случае приходит пустым, и открытие по файлу падало бы с `E_NO_LAUNCHER`
+/// всегда — то есть официальный лаунчер после установки не возвращался.
 #[tauri::command]
-pub async fn reopen_launcher(exe: Option<String>) -> Cmd<String> {
-    let exe = exe.map(PathBuf::from).ok_or(InstallError::NoLauncher)?;
-    tauri::async_runtime::spawn_blocking(move || detect::reopen_launcher(&exe))
-        .await?
-        .map_err(CmdError::from)
+pub async fn reopen_launcher(launcher: LauncherKind, exe: Option<String>) -> Cmd<String> {
+    let exe = exe.map(PathBuf::from);
+    tauri::async_runtime::spawn_blocking(move || match launcher {
+        LauncherKind::Official => official::launch_official(exe.as_deref()),
+        LauncherKind::Manual => Err(InstallError::NoLauncher),
+        _ => {
+            let exe = exe.ok_or(InstallError::NoLauncher)?;
+            detect::reopen_launcher(&exe)
+        }
+    })
+    .await?
+    .map_err(CmdError::from)
 }
 
 /// Прямой деплой модели в цель. Прогресс — событиями `deploy-progress`.
@@ -170,7 +185,7 @@ pub async fn deploy_pack(
         // Modrinth: профиль; TLauncher и ручная папка: сам game dir.
         // Деплой пишет только файлы профиля (saves/mods/config), базу не
         // трогает — запущенное приложение не мешает, запрета нет.
-        LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher => {
+        LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
             target.path.clone()
         }
     };
@@ -339,7 +354,7 @@ pub async fn ensure_tlauncher_version(
     mc_version: String,
     loader: LoaderKind,
     loader_version: Option<String>,
-) -> Cmd<tlauncher::EnsureResult> {
+) -> Cmd<vanilla::EnsureResult> {
     let data_dir = PathBuf::from(data_dir);
     // `%APPDATA%` (дом `.tlauncher` с конфигом и комплектным JRE).
     let roaming = dirs::config_dir();
@@ -355,6 +370,103 @@ pub async fn ensure_tlauncher_version(
         &progress,
     )
     .await
+    .map_err(CmdError::from)
+}
+
+/// Подготовка версии Legacy Launcher. Отличие от TLauncher: `data_dir` — это
+/// папка установки лаунчера (где `LL.exe` и `tl.properties`), а папка игры и
+/// папка цели вычисляются из его конфига по выбранному режиму подпапок.
+#[tauri::command]
+pub async fn ensure_legacy_version(
+    app: tauri::AppHandle,
+    install_dir: String,
+    mc_version: String,
+    loader: LoaderKind,
+    loader_version: Option<String>,
+) -> Cmd<vanilla::EnsureResult> {
+    let install_dir = PathBuf::from(install_dir);
+    let progress = |ev: deploy::StageEvent| {
+        app.emit("provision-progress", &ev).ok();
+    };
+    let config = legacy::LegacyConfig::load(&install_dir).ok_or(InstallError::NoDataDir {
+        launcher: "Legacy Launcher (не найден tl.properties)".to_string(),
+    })?;
+    legacy::ensure_version(
+        &config,
+        &mc_version,
+        loader,
+        loader_version.as_deref(),
+        &progress,
+    )
+    .await
+    .map_err(CmdError::from)
+}
+
+/// Подготовка официального Minecraft Launcher: готовим версию в общем корне и
+/// создаём СВОЮ установку с отдельной папкой игры под карту. Существующие
+/// установки лаунчера не трогаем.
+#[tauri::command]
+pub async fn ensure_official_installation(
+    app: tauri::AppHandle,
+    data_dir: String,
+    name: String,
+    mc_version: String,
+    loader: LoaderKind,
+    loader_version: Option<String>,
+    icon_path: Option<String>,
+) -> Cmd<vanilla::EnsureResult> {
+    let data_dir = PathBuf::from(data_dir);
+    let icon = icon_path
+        .as_deref()
+        .and_then(|p| official::icon_data_uri(Some(Path::new(p))));
+    let progress = |ev: deploy::StageEvent| {
+        app.emit("provision-progress", &ev).ok();
+    };
+    official::ensure_installation(
+        &data_dir,
+        &name,
+        &mc_version,
+        loader,
+        loader_version.as_deref(),
+        icon.as_deref(),
+        &progress,
+    )
+    .await
+    .map_err(CmdError::from)
+}
+
+/// Прописывает мир в панель Quick Play официального лаунчера — после успешного
+/// деплоя, когда известно итоговое имя папки мира. Возвращает, включён ли
+/// Quick Play в настройках лаунчера, чтобы фронт мог предупредить пользователя.
+#[tauri::command]
+pub async fn add_official_quick_play(
+    data_dir: String,
+    target: GameTarget,
+    world_dir_name: String,
+    world_name: String,
+    icon_path: Option<String>,
+) -> Cmd<bool> {
+    let data_dir = PathBuf::from(data_dir);
+    tauri::async_runtime::spawn_blocking(move || {
+        // Ищем нашу установку по её папке игры: id нужен для `configId`.
+        let inst = official::read_installations(&data_dir)
+            .into_iter()
+            .find(|i| i.dir_in(&data_dir) == target.path)
+            .ok_or(InstallError::NoDataDir {
+                launcher: "Minecraft Launcher (наша установка не найдена)".to_string(),
+            })?;
+        let icon = icon_path
+            .as_deref()
+            .and_then(|p| official::icon_data_uri(Some(Path::new(p))));
+        official::add_quick_play(
+            &data_dir,
+            &inst.id,
+            &world_dir_name,
+            &world_name,
+            icon.as_deref(),
+        )
+    })
+    .await?
     .map_err(CmdError::from)
 }
 
@@ -377,7 +489,7 @@ pub async fn suggest_world_name(target: GameTarget, world_name: String) -> Cmd<S
             | LauncherKind::Pinecone
             | LauncherKind::Polymc
             | LauncherKind::Multimc => normalize::prism_game_root(&target.path),
-            LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher => {
+            LauncherKind::Modrinth | LauncherKind::Manual | LauncherKind::Tlauncher | LauncherKind::Legacy | LauncherKind::Official => {
                 target.path.clone()
             }
         };
@@ -425,6 +537,23 @@ pub async fn launch_game(
                 .ok_or(InstallError::NoLauncher)?;
             tlauncher::launch_tlauncher(&exe)
         }
+        LauncherKind::Legacy => {
+            let exe = exe
+                .map(PathBuf::from)
+                .ok_or(InstallError::NoLauncher)?;
+            // `load` сам разберётся с exe вместо папки установки.
+            let config = legacy::LegacyConfig::load(&exe).ok_or_else(|| {
+                InstallError::NoDataDir {
+                    launcher: "Legacy Launcher (не найден tl.properties)".to_string(),
+                }
+            })?;
+            // `instance_id` здесь — имя версии: Legacy выбирает её только
+            // через `login.version`, своего CLI нет.
+            legacy::launch_legacy(&config, &instance_id)
+        }
+        // У официального лаунчера нет CLI запуска: открываем приложение (по
+        // AUMID, если Store-сборка) — профиль и так только что выбран нами.
+        LauncherKind::Official => official::launch_official(exe.as_deref().map(Path::new)),
         LauncherKind::Manual => {
             let folder = folder
                 .map(PathBuf::from)

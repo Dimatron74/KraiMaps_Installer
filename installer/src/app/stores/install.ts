@@ -10,11 +10,12 @@ import type {
   EnsureResult,
   GameTarget,
   LauncherInfo,
+  LauncherKind,
   LoaderKind,
   PackAnalysis,
   StageEvent,
 } from '../../shared/types/installer';
-import { LOADER_NAMES } from '../../shared/types/installer';
+import { LAUNCHER_NAMES, LOADER_NAMES } from '../../shared/types/installer';
 
 export type Step =
   | 'file'
@@ -30,6 +31,8 @@ export type Step =
 
 export interface InstallError extends CmdError {
   hint: string;
+  /** Официальная страница, где решается проблема. Кнопка, а не текст в подсказке. */
+  action?: { label: string; url: string };
 }
 
 /** Мета карты с сайта (install-manifest): влияет на версию загрузчика. */
@@ -54,8 +57,19 @@ export function mapSiteLoaderSlug(slug: string | null | undefined): LoaderKind |
 const MANUAL_ROOTS_KEY = 'mi.manualRoots';
 const KNOWN_ROOTS_KEY = 'mi.knownRoots';
 
+/**
+ * Лаунчеры без инстансов: у них цели — версии, а не папки профилей, поэтому
+ * новую цель готовит отдельная команда (`ensure_*`), а не `create_instance`.
+ */
+export const VERSION_LAUNCHERS: LauncherKind[] = ['tlauncher', 'legacy', 'official'];
+
+function isVersionLauncher(kind: LauncherKind): boolean {
+  return VERSION_LAUNCHERS.includes(kind);
+}
+
 /** Подсказка следующего шага по коду ошибки (человекочитаемо, без жаргона). */
-function hintFor(code: string, modrinthRunning: boolean, tlauncherRunning: boolean): string {
+function hintFor(code: string, running: LauncherKind[], launcher: LauncherKind | null): string {
+  const name = launcher ? LAUNCHER_NAMES[launcher] : null;
   switch (code) {
     case 'E_NO_LEVEL_DAT':
       return 'В архиве нет мира. Проверьте, что это карта Minecraft, а не модпак или инструкция.';
@@ -73,17 +87,21 @@ function hintFor(code: string, modrinthRunning: boolean, tlauncherRunning: boole
       return 'Укажите папку игры вручную — ванильную карту можно поставить и без лаунчера.';
     case 'E_MODRINTH_SCHEMA':
       return 'База Modrinth App изменилась после обновления. Попробуйте ещё раз или обратитесь в поддержку.';
+    case 'E_NO_DATA_DIR':
+      return name
+        ? `${name} не найден или не настроен. Запустите его один раз и повторите установку.`
+        : 'Не нашли папку данных лаунчера. Запустите его один раз и повторите установку.';
     case 'E_NO_JAVA':
-      return 'Не нашли Java 17+ для подготовки версии игры. Запустите TLauncher один раз — он докачает нужный рантайм сам.';
+      return 'Установите Java 17 или новее — она нужна только для подготовки версии игры, сама игра запускается на рантайме лаунчера.';
     case 'E_PROVISION_FAILED':
       return 'Не получилось подготовить версию игры. Проверьте интернет и попробуйте снова.';
     case 'E_HASH_MISMATCH':
       return 'Скачанный установщик не прошёл проверку. Попробуйте снова — качаем только с официальных серверов.';
     case 'E_LAUNCH_FAILED':
-      if (tlauncherRunning) {
-        return 'Не получилось открыть TLauncher. Запустите его вручную.';
+      if (name) {
+        return `Не получилось открыть ${name}. Запустите его вручную.`;
       }
-      return modrinthRunning
+      return running.length > 0
         ? 'Не получилось открыть приложение. Запустите его вручную.'
         : 'Проверьте, что лаунчер на месте, и попробуйте ещё раз.';
     default:
@@ -91,14 +109,30 @@ function hintFor(code: string, modrinthRunning: boolean, tlauncherRunning: boole
   }
 }
 
-function toInstallError(e: unknown, modrinthRunning: boolean, tlauncherRunning: boolean): InstallError {
+/**
+ * Официальный источник Java. Eclipse Adoptium — сборки Temurin, на них
+ * ссылается и сам Minecraft Launcher. Версию 17 берём из фильтра на
+ * странице: так ссылка не протухнет при выходе новых LTS.
+ */
+const JAVA_DOWNLOAD_URL = 'https://adoptium.net/temurin/releases/?version=17';
+
+/** Ошибки, где нужен не текст подсказки, а действие по официальной ссылке. */
+function actionFor(code: string): InstallError['action'] {
+  if (code === 'E_NO_JAVA') {
+    return { label: 'Скачать Java 17', url: JAVA_DOWNLOAD_URL };
+  }
+  return undefined;
+}
+
+function toInstallError(e: unknown, running: LauncherKind[], launcher: LauncherKind | null): InstallError {
   const err = e as Partial<CmdError>;
   const code = typeof err.code === 'string' ? err.code : 'E_IO';
   return {
     code,
     message: toUserMessage(e),
     details: toErrorDetails(e),
-    hint: hintFor(code, modrinthRunning, tlauncherRunning),
+    hint: hintFor(code, running, launcher),
+    action: actionFor(code),
   };
 }
 
@@ -145,8 +179,8 @@ export const useInstallStore = defineStore('install', {
     knownRoots: [] as string[],
     /** Идёт ли деплой модов с wipe (для экрана wipe). */
     wipeConfirmed: false,
-    /** Заметка про TLauncher для экрана Done (предвыбор версии пропущен). */
-    tlauncherNote: null as string | null,
+    /** Заметка про предвыбор версии для экрана Done. */
+    versionNote: null as string | null,
     /**
      * Лаунчер работал на старте установки (замер до первого бэкенд-вызова —
      * бэкенд сам закрывает Modrinth/TLauncher при create/ensure и съел бы
@@ -262,14 +296,14 @@ export const useInstallStore = defineStore('install', {
       this.busy = false;
       this.statusLine = '';
       this.wipeConfirmed = false;
-      this.tlauncherNote = null;
+      this.versionNote = null;
     },
 
     fail(e: unknown, returnStep: Step) {
       this.error = toInstallError(
         e,
-        this.detection?.modrinth_running ?? false,
-        this.detection?.tlauncher_running ?? false,
+        this.detection?.running ?? [],
+        this.launcher?.kind ?? null,
       );
       this.errorReturnStep = returnStep;
       this.step = 'error';
@@ -469,18 +503,21 @@ export const useInstallStore = defineStore('install', {
      * чтобы повторный вызов не открыл его дважды.
      */
     async endInstallWork() {
-      if (!this.launcherWasRunning) return;
+      const launcher = this.launcher;
+      if (!launcher || !this.launcherWasRunning) return;
       this.launcherWasRunning = false;
-      await api.reopenLauncher(this.launcher?.exe_path ?? null).catch(() => {});
+      await api.reopenLauncher(launcher.kind, launcher.exe_path).catch(() => {});
     },
 
     async createNewTarget() {
       const pack = this.pack;
       const launcher = this.launcher;
       if (!pack || !launcher || launcher.kind === 'manual') return;
-      // У TLauncher нет инстансов: вместо создания — подготовка версии.
-      if (launcher.kind === 'tlauncher') {
-        await this.createTlauncherTarget();
+      // У TLauncher, Legacy Launcher и официального лаунчера цели — версии,
+      // а не инстансы: их готовит отдельная команда, `create_instance` не
+      // вызывается.
+      if (isVersionLauncher(launcher.kind)) {
+        await this.createVersionTarget();
         return;
       }
       const mc = pack.world_version;
@@ -575,29 +612,44 @@ export const useInstallStore = defineStore('install', {
     },
 
     /**
-     * Цель для TLauncher: инстансов нет, общий game dir.
-     * Ванилла — синтетическая цель сразу в деплой (версии не нужны).
-     * Модовая — подготовка версии официальным установщиком
-     * (ensure_tlauncher_version): поиск → провижининг → пометка [KK] →
-     * предвыбор. Общие mods/ никогда не «свежие»: targetIsFresh ставим
-     * только если mods/ реально пуста, иначе дальше wipe-экран.
+     * Цель для лаунчера «без инстансов» — TLauncher, Legacy Launcher или
+     * официальный Minecraft Launcher.
+     *
+     * Официальный лаунчер: создаём СВОЮ установку с отдельной папкой игры
+     * даже для ванильной карты — в этом его смысл, и чужие установки
+     * пользователя при этом не трогаем.
+     *
+     * TLauncher и Legacy: у них одна папка игры на все версии. Ванилле
+     * версия не нужна — синтетическая цель сразу в деплой. Модовой карте
+     * версию готовит официальный установщик загрузчика: поиск → провижининг →
+     * пометка [KK] → предвыбор. Общие `mods/` никогда не «свежие»: свежесть
+     * ставим только если папка реально пуста, иначе дальше wipe-экран.
      */
-    async createTlauncherTarget() {
+    async createVersionTarget() {
       const pack = this.pack;
       const launcher = this.launcher;
-      if (!pack || !launcher || launcher.kind !== 'tlauncher') return;
+      if (!pack || !launcher || !isVersionLauncher(launcher.kind)) return;
+      const kind = launcher.kind;
       const wasStep = this.step;
       this.busy = true;
       this.progress = null;
-      this.tlauncherNote = null;
-      if (!pack.is_modded) {
+      this.versionNote = null;
+
+      const mc = pack.world_version;
+      // TLauncher — единственный из «без инстансов», кому ванилле версия не
+      // нужна: у него одна папка игры на все версии. Legacy раскладывает
+      // saves по подпапкам режима, поэтому даже ванильной карте нужна
+      // подготовка — указать папку `home/<версия>` и предвыбрать версию.
+      // Официальному лаунчеру нужна своя установка.
+      const needsVersion = pack.is_modded || kind === 'official' || kind === 'legacy';
+      if (!needsVersion) {
         this.statusLine = 'Готовим цель…';
         this.step = 'deploying';
         this.target = {
-          launcher: 'tlauncher',
-          name: 'TLauncher',
+          launcher: kind,
+          name: LAUNCHER_NAMES[kind],
           path: launcher.data_dir,
-          minecraft_version: pack.world_version ?? '',
+          minecraft_version: mc ?? '',
           loader: 'vanilla',
           loader_version: null,
         };
@@ -605,7 +657,6 @@ export const useInstallStore = defineStore('install', {
         await this.proceedAfterTarget();
         return;
       }
-      const mc = pack.world_version;
       if (!mc) {
         this.fail(
           {
@@ -627,33 +678,55 @@ export const useInstallStore = defineStore('install', {
       });
       try {
         const siteVersion = this.siteMeta?.loaderVersion?.trim() || null;
-        const loaderVersion = await api.resolveLoaderVersion(
-          pack.loader,
-          mc,
-          siteVersion ?? pack.loader_version_hint,
-        );
         const baseHint = siteVersion ?? pack.loader_version_hint;
+        const loaderVersion = pack.is_modded
+          ? await api.resolveLoaderVersion(pack.loader, mc, baseHint ?? null)
+          : null;
         this.loaderVersion = loaderVersion;
         this.loaderVersionAuto = loaderVersion !== baseHint;
-        this.statusLine = 'Ставим версию игры — это займёт несколько минут…';
-        const res: EnsureResult = await api.ensureTlauncherVersion({
-          dataDir: launcher.data_dir,
-          mcVersion: mc,
-          loader: pack.loader,
-          loaderVersion,
-        });
+        this.statusLine = pack.is_modded
+          ? 'Ставим версию игры — это займёт несколько минут…'
+          : 'Готовим установку…';
+
+        let res: EnsureResult;
+        if (kind === 'official') {
+          // `installDir` официального лаунчера — это его корень данных;
+          // exe лежит в другом месте, поэтому передаём data_dir.
+          res = await api.ensureOfficialInstallation({
+            dataDir: launcher.data_dir,
+            name: `${this.siteTitle ?? pack.world_name} ${mc}`,
+            mcVersion: mc,
+            loader: pack.loader,
+            loaderVersion,
+            iconPath: this.siteIconPath,
+          });
+        } else if (kind === 'legacy') {
+          res = await api.ensureLegacyVersion({
+            installDir: launcher.exe_path ?? launcher.data_dir,
+            mcVersion: mc,
+            loader: pack.loader,
+            loaderVersion,
+          });
+        } else {
+          res = await api.ensureTlauncherVersion({
+            dataDir: launcher.data_dir,
+            mcVersion: mc,
+            loader: pack.loader,
+            loaderVersion,
+          });
+        }
         this.target = res.target;
         // Общие mods/ свежие, только если реально пусты.
         this.targetIsFresh = res.mods_empty;
         if (!res.preselected) {
-          this.tlauncherNote = `TLauncher не удалось закрыть — выберите версию «${res.target.name}» в лаунчере вручную.`;
+          this.versionNote = `${LAUNCHER_NAMES[kind]} не удалось закрыть — выберите версию «${res.target.name}» в лаунчере вручную.`;
         }
         // Обновляем детект, чтобы подготовленная версия была видна везде.
         this.detection = await api.detectLaunchers(this.manualRoots, this.knownRoots);
         this.rememberRoots();
         this.launcher =
           this.detection.launchers.find(
-            (l) => l.kind === 'tlauncher' && l.data_dir === launcher.data_dir,
+            (l) => l.kind === kind && l.data_dir === launcher.data_dir,
           ) ?? launcher;
         await this.proceedAfterTarget();
       } catch (e) {
@@ -745,12 +818,42 @@ export const useInstallStore = defineStore('install', {
         this.statusLine = '';
         this.step = 'done';
         this.discardTempLeftovers();
+        await this.registerQuickPlay();
       } catch (e) {
         this.fail(e, 'target');
       } finally {
         unlisten();
         // Reopen — и на успехе, и на провале: раз закрыли, надо вернуть.
         await this.endInstallWork();
+      }
+    },
+
+    /**
+     * У официального лаунчера «Играть» работает через панель Quick Play:
+     * прописываем мир в `launcher_quick_play.json`, и клик по иконке открывает
+     * игру сразу в нём. Best-effort — установка уже успешна, подсказывать
+     * пользователю ничего не нужно, максимум — тихо пропускаем.
+     */
+    async registerQuickPlay() {
+      const target = this.target;
+      const report = this.report;
+      const launcher = this.launcher;
+      if (!target || !report || !launcher || launcher.kind !== 'official') return;
+      try {
+        const enabled = await api.addOfficialQuickPlay({
+          dataDir: launcher.data_dir,
+          target,
+          worldDirName: report.world_dir_name,
+          worldName: this.finalWorldName || report.world_dir_name,
+          iconPath: this.siteIconPath,
+        });
+        if (!enabled) {
+          this.versionNote =
+            'Чтобы открыть мир одним кликом, включите «Быстрый запуск» (Quick Play) в настройках Minecraft Launcher.';
+        }
+      } catch {
+        // Установка уже успешна: панель быстрого запуска — необязательный
+        // бонус, молча пропускаем.
       }
     },
 
@@ -782,11 +885,13 @@ export const useInstallStore = defineStore('install', {
             world: null,
             folder: null,
           });
-        } else if (target.launcher === 'tlauncher') {
+        } else if (isVersionLauncher(target.launcher)) {
+          // Для TLauncher/Legacy `instanceId` — имя версии (её выбирает CLI
+          // лаунчера), для официального — что угодно: запускается приложение.
           await api.launchGame({
-            launcher: 'tlauncher',
+            launcher: target.launcher,
             exe,
-            instanceId: target.path,
+            instanceId: target.name,
             world: null,
             folder: null,
           });

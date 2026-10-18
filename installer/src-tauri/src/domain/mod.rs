@@ -152,8 +152,10 @@ impl InstallError {
 
 /// Поддерживаемые лаунчеры. Prism-семейство (Prism, Pinecone — бывший ElyPrism,
 /// PolyMC, MultiMC: общий формат `instances/*/instance.cfg + mmc-pack.json`
-/// и CLI `--launch <id>`) + Modrinth (+ ручная папка для ваниллы),
-/// плюс TLauncher (общий game dir без инстансов, версии в `versions/`).
+/// и CLI `--launch <id>`) + Modrinth (профили в `app.db`), ручная папка,
+/// официальный Minecraft Launcher (у него «Установки» — профили в
+/// `launcher_profiles.json` со своей папкой игры) и два лаунчера без инстансов
+/// (TLauncher и Legacy Launcher: версии в `versions/`, общий движок — `adapters/vanilla`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LauncherKind {
@@ -164,6 +166,8 @@ pub enum LauncherKind {
     Modrinth,
     Manual,
     Tlauncher,
+    Legacy,
+    Official,
 }
 
 /// Загрузчик модов. `Vanilla` — мир без модов (живёт в любом инстансе).
@@ -201,6 +205,11 @@ pub struct LauncherInfo {
     pub data_dir: PathBuf,
     pub portable: bool,
     pub targets: Vec<GameTarget>,
+    /// Само приложение найдено (exe или запись в реестре установленных
+    /// программ). `false` — осталась только папка с данными: карта туда
+    /// поставить даст, а «Играть» не сработает.
+    #[serde(default)]
+    pub app_found: bool,
 }
 
 /// Результат анализа zip: нормализованная модель пака (§14 ТЗ).
@@ -469,6 +478,18 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&LauncherKind::Tlauncher).expect("json"),
             "\"tlauncher\""
+        );
+    }
+
+    #[test]
+    fn new_kinds_use_lowercase_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&LauncherKind::Legacy).expect("json"),
+            "\"legacy\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LauncherKind::Official).expect("json"),
+            "\"official\""
         );
     }
 

@@ -77,6 +77,50 @@ export const api = {
   },
 
   /**
+   * Подготовка версии Legacy Launcher. `installDir` — папка установки
+   * лаунчера (где `LL.exe` и `tl.properties`): он сам скажет, где папка
+   * игры и какой режим подпапок выбран.
+   */
+  ensureLegacyVersion(args: {
+    installDir: string;
+    mcVersion: string;
+    loader: LoaderKind;
+    loaderVersion: string | null;
+  }): Promise<EnsureResult> {
+    return invoke('ensure_legacy_version', args);
+  },
+
+  /**
+   * Официальный Minecraft Launcher: готовим версию в общем корне и создаём
+   * СВОЮ установку с отдельной папкой игры под карту. Установки пользователя
+   * не трогаем.
+   */
+  ensureOfficialInstallation(args: {
+    dataDir: string;
+    name: string;
+    mcVersion: string;
+    loader: LoaderKind;
+    loaderVersion: string | null;
+    iconPath: string | null;
+  }): Promise<EnsureResult> {
+    return invoke('ensure_official_installation', args);
+  },
+
+  /**
+   * Прописывает мир в панель Quick Play (после успешного деплоя).
+   * Возвращает, включён ли Quick Play в настройках лаунчера.
+   */
+  addOfficialQuickPlay(args: {
+    dataDir: string;
+    target: GameTarget;
+    worldDirName: string;
+    worldName: string;
+    iconPath: string | null;
+  }): Promise<boolean> {
+    return invoke('add_official_quick_play', args);
+  },
+
+  /**
    * Иконка нового инстанса из архива (`pack.png`/`icon.png`).
    * Best-effort: неуспех — это `null`, установка идёт дальше.
    */
@@ -109,10 +153,12 @@ export const api = {
 
   /**
    * Открывает лаунчер после установки (только если был запущен на старте).
+   * `launcher` обязателен: у Store-сборки официального лаунчера exe нет вовсе,
+   * и запускать его надо по AUMID — по одному `exe` его не открыть.
    * Best-effort: неуспех глотает вызыватель — установка уже успешна.
    */
-  reopenLauncher(exe: string | null): Promise<string> {
-    return invoke('reopen_launcher', { exe });
+  reopenLauncher(launcher: LauncherKind, exe: string | null): Promise<string> {
+    return invoke('reopen_launcher', { launcher, exe });
   },
 
   suggestWorldName(target: GameTarget, worldName: string): Promise<string> {

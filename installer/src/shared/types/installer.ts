@@ -1,6 +1,15 @@
 /** TS-зеркала доменных типов Rust (src-tauri/src/domain). */
 
-export type LauncherKind = 'prism' | 'pinecone' | 'polymc' | 'multimc' | 'modrinth' | 'manual' | 'tlauncher';
+export type LauncherKind =
+  | 'prism'
+  | 'pinecone'
+  | 'polymc'
+  | 'multimc'
+  | 'modrinth'
+  | 'manual'
+  | 'tlauncher'
+  | 'legacy'
+  | 'official';
 export type LoaderKind = 'vanilla' | 'fabric' | 'forge' | 'quilt' | 'neoforge';
 
 export interface ModInfo {
@@ -72,12 +81,18 @@ export interface LauncherInfo {
   /** Данные рядом с exe, а не в стандартном месте. */
   portable: boolean;
   targets: GameTarget[];
+  /**
+   * Приложение найдено (exe на месте или есть запись в списке установленных
+   * программ). `false` — осталась только папка с данными: карту поставить
+   * можно, а запустить лаунчер нечем.
+   */
+  app_found: boolean;
 }
 
 export interface Detection {
   launchers: LauncherInfo[];
-  modrinth_running: boolean;
-  tlauncher_running: boolean;
+  /** Какие лаунчеры запущены сейчас (закрываются на время установки). */
+  running: LauncherKind[];
 }
 
 export interface DeployPlan {
@@ -137,6 +152,8 @@ export const LAUNCHER_NAMES: Record<LauncherKind, string> = {
   modrinth: 'Modrinth App',
   manual: 'Папка вручную',
   tlauncher: 'TLauncher',
+  legacy: 'Legacy Launcher',
+  official: 'Minecraft Launcher',
 };
 
 export const LOADER_NAMES: Record<LoaderKind, string> = {
