@@ -1,12 +1,37 @@
 <script setup lang="ts">
 import { open } from '@tauri-apps/plugin-dialog';
+import { computed } from 'vue';
 import { useInstallStore, VERSION_LAUNCHERS } from '../../../app/stores/install';
 import { api } from '../../../shared/api/commands';
-import { LAUNCHER_NAMES } from '../../../shared/types/installer';
+import { LAUNCHER_NAMES, type LauncherInfo } from '../../../shared/types/installer';
 import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
+import LauncherIcon from '../../../shared/ui/LauncherIcon.vue';
 
 const store = useInstallStore();
+
+/**
+ * Модовую карту в папку «вручную» поставить нельзя: сборка идёт через
+ * лаунчер (`.mrpack` импортируется лаунчером), поэтому такую карточку прячем.
+ */
+const cards = computed<LauncherInfo[]>(
+  () =>
+    store.detection?.launchers.filter((l) =>
+      store.pack?.is_modded ? l.kind !== 'manual' : true,
+    ) ?? [],
+);
+
+/** «Версий: 3» / «Инстансов: 3», а для пустого лаунчера — что будет дальше. */
+function summary(l: LauncherInfo): string {
+  if (l.targets.length === 0) {
+    return VERSION_LAUNCHERS.includes(l.kind)
+      ? 'Версий пока нет — установим нужную'
+      : 'Инстансов пока нет — создадим новый';
+  }
+  return VERSION_LAUNCHERS.includes(l.kind)
+    ? `Версий: ${l.targets.length}`
+    : `Инстансов: ${l.targets.length}`;
+}
 
 async function pickManualFolder() {
   const selected = await open({ multiple: false, directory: true });
@@ -50,44 +75,58 @@ async function pickManualFolder() {
 
     <div class="mt-4 space-y-2">
       <button
-        v-for="l in store.detection?.launchers.filter((x) =>
-          store.pack?.is_modded ? x.kind !== 'manual' : true,
-        ) ?? []"
+        v-for="l in cards"
         :key="l.kind + l.data_dir"
         type="button"
-        class="glass-card w-full p-4 text-left transition-colors hover:border-white/20 cursor-pointer"
+        class="glass-card group flex w-full items-center gap-3.5 p-3.5 text-left transition-colors hover:border-white/20 hover:bg-white/[0.04] cursor-pointer"
         @click="store.selectLauncher(l)"
       >
-        <p class="flex items-center gap-2 text-sm font-semibold text-primary">
-          {{ LAUNCHER_NAMES[l.kind] }}
-          <span
-            v-if="l.portable"
-            class="rounded-full bg-primary-500/15 px-2 py-0.5 text-[11px] font-bold text-primary-400"
-          >
-            Портативный
+        <LauncherIcon :kind="l.kind" />
+
+        <span class="min-w-0 flex-1">
+          <span class="flex items-center gap-2">
+            <span class="truncate text-sm font-semibold text-primary">
+              {{ LAUNCHER_NAMES[l.kind] }}
+            </span>
+            <span
+              v-if="l.portable"
+              class="shrink-0 rounded-full bg-primary-500/15 px-2 py-0.5 text-[11px] font-bold text-primary-400"
+            >
+              Портативный
+            </span>
+            <span
+              v-if="!l.app_found"
+              class="shrink-0 rounded-full bg-warning-500/15 px-2 py-0.5 text-[11px] font-bold text-warning-400"
+            >
+              Только папка
+            </span>
           </span>
-        </p>
-        <p class="mt-0.5 truncate font-mono text-[11px] text-tertiary">{{ l.data_dir }}</p>
-        <p class="mt-1 text-xs text-secondary">
-          <template v-if="VERSION_LAUNCHERS.includes(l.kind)">
-            {{
-              l.targets.length === 0
-                ? 'Версий пока нет — установим нужную'
-                : `Версий: ${l.targets.length}`
-            }}
-          </template>
-          <template v-else>
-            {{
-              l.targets.length === 0
-                ? 'Инстансов пока нет — создадим новый'
-                : `Инстансов: ${l.targets.length}`
-            }}
-          </template>
-        </p>
-        <p v-if="!l.app_found" class="mt-1 text-xs text-tertiary">
-          Приложение не найдено — осталась только папка с данными. Карту поставить можно, но
-          запустить лаунчер отсюда не выйдет.
-        </p>
+          <span
+            class="mt-0.5 block truncate font-mono text-[11px] text-tertiary"
+            :title="l.data_dir"
+          >
+            {{ l.data_dir }}
+          </span>
+          <span class="mt-1 block text-xs text-secondary">{{ summary(l) }}</span>
+          <span v-if="!l.app_found" class="mt-1 block text-xs text-tertiary">
+            Приложение не найдено — карту поставить можно, но запустить лаунчер отсюда не выйдет.
+          </span>
+        </span>
+
+        <svg
+          class="h-4 w-4 shrink-0 text-tertiary transition-colors group-hover:text-primary-400"
+          viewBox="0 0 16 16"
+          fill="none"
+          aria-hidden="true"
+        >
+          <path
+            d="M6 3.5 10.5 8 6 12.5"
+            stroke="currentColor"
+            stroke-width="1.5"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          />
+        </svg>
       </button>
     </div>
 
