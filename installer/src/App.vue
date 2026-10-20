@@ -19,12 +19,6 @@ const updater = useUpdaterStore();
 const router = useRouter();
 const route = useRoute();
 
-/**
- * Аватар шапки как на сайте (ProfileAvatar):
- * бэкенд отдаёт S3-ключ — полный URL собирает resolveMediaUrl.
- * computed реактивен: после входа/refresh картинка подгружается сама,
- * без перезапуска. Битая картинка → fallback с первой буквой ника.
- */
 const avatarSrc = computed(() => resolveMediaUrl(auth.user?.avatar_url));
 const avatarFailed = ref(false);
 watch(avatarSrc, () => {
@@ -185,8 +179,6 @@ async function logout() {
       class="relative flex flex-1 overflow-y-auto"
       :class="route.name === 'home' && auth.status !== 'unknown' ? '' : 'px-6 py-6'"
     >
-      <!-- Транзиент (I-3): «нет соединения» вместо экрана входа + предупреждение
-        хранилища (I-4.2). Оверлеем, чтобы не ломать раскладку страниц. -->
       <div
         v-if="auth.hasConnectionIssue || auth.storePersistent === false"
         class="absolute inset-x-0 top-0 z-10 mx-auto w-full max-w-2xl space-y-2 px-6 pt-3"
@@ -244,7 +236,6 @@ async function logout() {
         <RouterView />
       </div>
     </main>
-    <!-- Обновления: мягкий оффер поверх, жёсткий блок — вместо всего. -->
     <UpdateOffer v-if="updater.offerOpen && !updater.blocked" />
     <UpdateBlocked v-if="updater.blocked" />
   </div>
