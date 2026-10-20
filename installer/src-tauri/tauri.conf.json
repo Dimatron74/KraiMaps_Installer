@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "MapInstaller KraiMaps",
+  "productName": "Установщик карт КрайКарт",
   "version": "0.2.0",
   "identifier": "com.kraimaps.installer",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Установщик карт - КрайКарт",
+        "title": "Установщик карт КрайКарт",
         "width": 980,
         "height": 720,
         "minWidth": 760,
@@ -30,12 +30,30 @@
     "active": true,
     "targets": ["nsis"],
     "createUpdaterArtifacts": true,
+    "publisher": "KraiMaps",
+    "homepage": "https://kraimaps.ru",
+    "copyright": "© 2026 KraiMaps",
+    "category": "Game",
+    "shortDescription": "Установщик карт Minecraft и других игр с сайта KraiMaps",
+    "longDescription": "Установка карт Minecraft и других игр с сайта kraimaps.ru в любой современный лаунчер: vanilla-миры и сборки модов.",
+    "licenseFile": "./nsis/license.txt",
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper"
       },
       "nsis": {
-        "installMode": "currentUser"
+        "installMode": "currentUser",
+        "template": "./nsis/installer.nsi",
+        "languages": ["Russian"],
+        "displayLanguageSelector": false,
+        "customLanguageFiles": {
+          "Russian": "./nsis/Russian.nsh"
+        },
+        "headerImage": null,
+        "sidebarImage": "./nsis/assets/sidebar.bmp",
+        "uninstallerHeaderImage": null,
+        "installerIcon": "./icons/icon.ico",
+        "uninstallerIcon": "./icons/icon.ico"
       }
     }
   },

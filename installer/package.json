@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "preview": "vite preview",
+    "nsis:assets": "powershell -ExecutionPolicy Bypass -File scripts/build-nsis-assets.ps1",
     "tauri": "tauri"
   },
   "dependencies": {
