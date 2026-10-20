@@ -1,9 +1,9 @@
 [package]
-name = "installer"
+name = "MapInstaller"
 version = "0.2.0"
-description = "A Tauri App"
-authors = ["you"]
-edition = "2021"
+description = "KraiMaps Installer"
+authors = ["KraiMaps"]
+edition = "2026"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
