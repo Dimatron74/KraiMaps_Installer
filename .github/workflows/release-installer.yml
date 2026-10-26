@@ -288,7 +288,17 @@ jobs:
           tar -xzf installer-release.tgz
           EXE="$(find . -name '*-setup.exe' | head -1)"
           test -n "$EXE" || { echo "no *-setup.exe in bundle"; exit 1; }
-          echo "EXE=$EXE" >> "$GITHUB_ENV"
+          # GitHub сортирует ассеты релиза по ИМЕНИ (алфавитно, регистронезависимо);
+          # порядок загрузки и preserve_order на это не влияют. Имя бандла —
+          # кириллическое («Установщик карт КрайКарт…»), а латиница в коллации
+          # GitHub идёт раньше кириллицы, поэтому в Releases архив provenance
+          # оказывался выше установщика. Зеркало получает ASCII-имена:
+          # 'KraiMaps…' < 'provenance…' — установщик первым. Файл на S3 (сайт и
+          # обновлятор) не трогаем: там имя остаётся продуктовым.
+          RELEASE_EXE="KraiMaps-Installer-${{ needs.build.outputs.version }}-x64-setup.exe"
+          cp "$EXE" "$RELEASE_EXE"
+          cp "$EXE.sig" "$RELEASE_EXE.sig"
+          echo "EXE=$RELEASE_EXE" >> "$GITHUB_ENV"
 
       - name: Upload latest pointer to S3 (year cache)
         # Годовой кэш указателя безопасен, только потому что следующий шаг
@@ -323,7 +333,9 @@ jobs:
       # Ручной dispatch релиз не создаёт: ему не к чему его привязывать
       # (релиз GitHub всегда висит на теге), артефакты уходят только на S3.
       # Обычным пользователям нужен только .exe; подпись и суммы лежат
-      # отдельно в *-provenance.zip, чтобы лишние файлы не путали.
+      # отдельно в provenance-<version>.zip, чтобы лишние файлы не путали.
+      # Имена ассетов — ASCII: сортировка в Releases идёт по имени, а кириллица
+      # в коллации GitHub идёт после латиницы (см. шаг Unpack).
 
       - name: Provenance pack (sig + sums)
         if: github.ref_type == 'tag'
@@ -343,7 +355,7 @@ jobs:
           with open("SHA256SUMS.txt", "w", encoding="utf-8", newline="\n") as fh:
               fh.write(sums)
           version = os.environ["VERSION"]
-          zname = f"installer-{version}-provenance.zip"
+          zname = f"provenance-{version}.zip"
           with zipfile.ZipFile(zname, "w", zipfile.ZIP_DEFLATED) as z:
               z.write(exe + ".sig", f + ".sig")
               z.write("SHA256SUMS.txt", "SHA256SUMS.txt")
@@ -359,13 +371,15 @@ jobs:
         with:
           files: |
             ${{ env.EXE }}
-            installer-${{ needs.build.outputs.version }}-provenance.zip
+            provenance-${{ needs.build.outputs.version }}.zip
           fail_on_unmatched_files: true
           generate_release_notes: true
           body: |
             Установщик карт КрайКарт ${{ needs.build.outputs.version }}.
 
-            Архив `*-provenance.zip` — для проверки (подпись сборки + SHA-256).
+            [Скачать установщик для Windows (x64)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.EXE }})
+
+            Архив `provenance-*.zip` — для проверки (подпись сборки + SHA-256).
 
             Этот релиз собран и опубликован автоматически (CI) из исходников коммита тега — файлы приложены роботом, а не загружены человеком:
             - коммит: ${{ github.sha }}
