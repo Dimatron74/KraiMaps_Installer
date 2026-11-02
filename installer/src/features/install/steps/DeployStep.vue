@@ -6,7 +6,6 @@ import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
 import ProgressBar from '../../../shared/ui/ProgressBar.vue';
 import { formatBytes } from '../../../shared/utils/format';
-import CompatDetails from '../components/CompatDetails.vue';
 
 const store = useInstallStore();
 
@@ -175,13 +174,11 @@ const mbLine = computed(() => {
     <p v-if="compatHint" class="mx-auto mt-2 max-w-md text-center text-xs text-secondary">
       {{ compatHint }}
     </p>
-    <CompatDetails v-if="compatHint" :summary="store.compat" class="mx-auto max-w-md" />
     <Alert v-if="store.compatUnavailable" tone="warning" class="mx-auto mt-3 max-w-md">
       <p class="text-xs">{{ store.compatUnavailable }}</p>
       <p v-if="store.compatPreparationFailure" class="mt-1 text-xs">
         Карта установится без OptiFine.
       </p>
-      <CompatDetails :summary="store.compat" :failure="store.compatPreparationFailure" />
     </Alert>
     <div class="mx-auto mt-6 max-w-md">
       <ProgressBar

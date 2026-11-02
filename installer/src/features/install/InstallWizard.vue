@@ -2,6 +2,7 @@
 import { useInstallStore } from '../../app/stores/install';
 import ConfirmStep from './steps/ConfirmStep.vue';
 import ConflictStep from './steps/ConflictStep.vue';
+import CompatStep from './steps/CompatStep.vue';
 import DeployStep from './steps/DeployStep.vue';
 import DoneStep from './steps/DoneStep.vue';
 import ErrorStep from './steps/ErrorStep.vue';
@@ -27,6 +28,7 @@ const stepIndex: Record<string, number> = {
   confirm: 1,
   launcher: 2,
   target: 3,
+  compat: 3,
   wipe: 3,
   conflict: 3,
   deploying: 4,
@@ -70,6 +72,7 @@ const stepIndex: Record<string, number> = {
         <FileStep v-if="store.step === 'file' || store.step === 'analyzing'" />
         <ConfirmStep v-else-if="store.step === 'confirm'" />
         <LauncherStep v-else-if="store.step === 'launcher'" />
+        <CompatStep v-else-if="store.step === 'compat'" />
         <TargetStep v-else-if="store.step === 'target'" />
         <WipeStep v-else-if="store.step === 'wipe'" />
         <ConflictStep v-else-if="store.step === 'conflict'" />

@@ -5,7 +5,6 @@ import { useInstallStore } from '../../../app/stores/install';
 import { useSiteInstallStore } from '../../../app/stores/siteInstall';
 import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
-import CompatDetails from '../components/CompatDetails.vue';
 
 const store = useInstallStore();
 const site = useSiteInstallStore();
@@ -58,7 +57,6 @@ function goHome() {
       <p class="text-xs">
         Сборка совместимости установлена: {{ compat.display_name }}.
       </p>
-      <CompatDetails :summary="store.compat" :report="compat" />
     </Alert>
 
     <Alert v-else-if="store.compatUnavailable" tone="warning" class="mt-4 max-w-md text-left">
@@ -67,7 +65,6 @@ function goHome() {
         Карта установлена без OptiFine. Проверьте подключение; новую попытку со сборкой можно
         начать с главной.
       </p>
-      <CompatDetails :summary="store.compat" :failure="store.compatPreparationFailure" />
     </Alert>
 
     <Alert
@@ -76,7 +73,6 @@ function goHome() {
       class="mt-4 max-w-md text-left"
     >
       <p class="text-xs">{{ store.compatSkipReason }}</p>
-      <CompatDetails :summary="store.compat" />
     </Alert>
 
     <Alert v-else-if="compatFailed" tone="warning" class="mt-4 max-w-md text-left">
@@ -85,7 +81,6 @@ function goHome() {
       </p>
       <p class="mt-1 text-xs">Закройте игру, проверьте подключение и нажмите «Повторить».</p>
       <p v-if="compatVpnHint" class="mt-1 text-xs">{{ compatVpnHint }}</p>
-      <CompatDetails :summary="store.compat" :report="compat" />
       <Btn
         v-if="store.compatInDeploy"
         variant="secondary"

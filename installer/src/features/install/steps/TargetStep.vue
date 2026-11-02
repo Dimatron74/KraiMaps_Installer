@@ -4,7 +4,6 @@ import { useInstallStore } from '../../../app/stores/install';
 import { LAUNCHER_NAMES, LOADER_NAMES } from '../../../shared/types/installer';
 import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
-import CompatDetails from '../components/CompatDetails.vue';
 
 const store = useInstallStore();
 
@@ -32,26 +31,20 @@ const takenLabel = computed(() => {
       <template v-else> Ванильный мир установится в любой инстанс подходящей версии. </template>
     </p>
 
-    <Alert v-if="store.compatBranch" tone="info" class="mt-3">
+    <Alert v-if="store.compatBranch && !store.compatUnavailable" tone="info" class="mt-3">
       <p class="text-xs">
         Карта требует OptiFine. Сборка совместимости<template v-if="store.compatTargetMethod">
           {{ store.compatTargetMethod }}</template>
         ставится только в новый инстанс, созданный установщиком: в существующем она может
         конфликтовать с вашими модами.
       </p>
-      <CompatDetails :summary="store.compat" />
     </Alert>
 
-    <Alert v-if="store.compatBusy" tone="info" class="mt-3">
-      <p class="text-xs">Готовим сборку совместимости…</p>
-    </Alert>
-
-    <Alert v-else-if="store.compatUnavailable" tone="warning" class="mt-3">
+    <Alert v-if="store.compatUnavailable" tone="warning" class="mt-3">
       <p class="text-xs">{{ store.compatUnavailable }}</p>
       <p v-if="store.compatPreparationFailure" class="mt-1 text-xs">
         Карта установится без OptiFine.
       </p>
-      <CompatDetails :summary="store.compat" :failure="store.compatPreparationFailure" />
     </Alert>
 
     <Alert v-if="store.loaderVersionAuto && store.loaderVersion" tone="info" class="mt-3">
@@ -65,7 +58,7 @@ const takenLabel = computed(() => {
         :key="t.launcher + t.path"
         type="button"
         class="glass-card w-full p-4 text-left transition-colors hover:border-white/20 cursor-pointer"
-        :disabled="store.busy || store.compatBusy"
+        :disabled="store.busy"
         @click="store.selectTarget(t)"
       >
         <p class="text-sm font-semibold text-primary">{{ t.name }}</p>
@@ -85,7 +78,7 @@ const takenLabel = computed(() => {
         v-else-if="store.newTargetCta"
         type="button"
         class="w-full rounded-xl border border-dashed border-primary-500/40 p-4 text-left transition-colors hover:border-primary-400 cursor-pointer"
-        :disabled="store.busy || store.compatBusy"
+        :disabled="store.busy"
         @click="store.createNewTarget()"
       >
         <p class="text-sm font-semibold text-primary-400">{{ store.newTargetCta.title }}</p>
@@ -94,7 +87,7 @@ const takenLabel = computed(() => {
     </div>
 
     <div class="mt-4">
-      <Btn variant="secondary" :disabled="store.busy || store.compatBusy" @click="store.step = 'launcher'">
+      <Btn variant="secondary" :disabled="store.busy" @click="store.step = 'launcher'">
         Назад
       </Btn>
     </div>

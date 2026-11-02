@@ -27,6 +27,7 @@ export type Step =
   | 'confirm'
   | 'launcher'
   | 'target'
+  | 'compat'
   | 'wipe'
   | 'conflict'
   | 'deploying'
@@ -294,8 +295,6 @@ export const useInstallStore = defineStore('install', {
     compatUnavailable: null as string | null,
     compatPreparationFailure: null as CompatFailure | null,
     compatPrepared: false,
-    /** Идёт резолв/скачивание `.mrpack` для слоя (экран цели ждёт). */
-    compatBusy: false,
     /** Мета install-manifest (только site-поток; ручной выбор файла — null). */
     siteMeta: null as SiteMeta | null,
     /** Архив пришёл со скачивания с сайта (лежит в нашем temp) — после успеха
@@ -582,7 +581,6 @@ export const useInstallStore = defineStore('install', {
       this.compatUnavailable = null;
       this.compatPreparationFailure = null;
       this.compatPrepared = false;
-      this.compatBusy = false;
       this.step = 'file';
       this.zipPath = '';
       this.pack = null;
@@ -785,15 +783,18 @@ export const useInstallStore = defineStore('install', {
     },
 
     /**
-     * Экран цели после выбора лаунчера. Слой резолвится один раз и до показа
-     * CTA: от него зависят загрузчик новой цели и подпись кнопки. Тихое
+     * После выбора лаунчера: при необходимости показываем отдельный экран
+     * подготовки слоя — от него зависят загрузчик и версия новой цели. Тихое
      * авто-создание ждёт резолв, иначе создался бы ванильный инстанс.
      */
     async afterLauncherChosen() {
       const generation = compatGeneration;
-      this.step = 'target';
+      const willPrepare =
+        !this.compatPrepared && this.requiresOptifine && !this.pack?.is_modded && !!this.compatBranch;
+      this.step = willPrepare ? 'compat' : 'target';
       await this.prepareCompat();
       if (generation !== compatGeneration) return;
+      this.step = 'target';
       if (this.suitableTargets.length === 0) {
         void this.createNewTarget();
       }
@@ -826,7 +827,6 @@ export const useInstallStore = defineStore('install', {
         return;
       }
       const generation = compatGeneration;
-      this.compatBusy = true;
       const request = (compatRequest = (async () => {
         try {
           const summary = await api.prepareCompat(mc, false);
@@ -849,12 +849,10 @@ export const useInstallStore = defineStore('install', {
         await request;
       } finally {
         // Ссылку снимаем, только если запрос всё ещё наш: после `reset()`
-        // мог начаться новый — иначе старый finally обнулил бы его, а новый
-        // флоу остался бы с «залипшим» busy.
+        // мог начаться новый — иначе старый finally обнулил бы его.
         if (compatRequest === request) compatRequest = null;
         if (generation === compatGeneration) {
           this.compatPrepared = true;
-          this.compatBusy = false;
         }
       }
     },
