@@ -86,6 +86,7 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
       min_supported: ${{ steps.ver.outputs.min_supported }}
+      notes: ${{ steps.ver.outputs.notes }}
       exe_name: ${{ steps.art.outputs.exe_name }}
     env:
       TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -365,6 +366,42 @@ jobs:
         env:
           VERSION: ${{ needs.build.outputs.version }}
 
+      # Тело релиза собирается в файл, а не инлайном в `body:`: changelog из
+      # сообщения тега многострочный и в инлайн-скаляре ломает отступы YAML.
+      # Пустой changelog (лёгкий тег) блок не выводит вовсе.
+      - name: Compose release body
+        if: github.ref_type == 'tag'
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          NOTES: ${{ needs.build.outputs.notes }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          {
+            echo "Установщик карт КрайКарт ${VERSION}."
+            echo
+            echo "[Скачать установщик для Windows (x64)](${REPO_URL}/releases/download/${GITHUB_REF_NAME}/${EXE})"
+            echo
+            if [[ -n "${NOTES//[[:space:]]/}" ]]; then
+              echo '<div class="changelog">'
+              echo
+              echo '### Что нового'
+              echo
+              printf '%s\n' "$NOTES"
+              echo
+              echo '</div>'
+              echo
+            fi
+            echo 'Архив `provenance-*.zip` — для проверки (подпись сборки + SHA-256).'
+            echo
+            echo 'Этот релиз собран и опубликован автоматически (CI) из исходников коммита тега — файлы приложены роботом, а не загружены человеком:'
+            echo "- коммит: ${{ github.sha }}"
+            echo "- прогон сборки: ${REPO_URL}/actions/runs/${{ github.run_id }}"
+            echo
+            echo 'Как убедиться, что файл тот самый:'
+            echo '1. Сверь SHA-256 установщика с `SHA256SUMS.txt` из provenance-архива.'
+            echo '2. Основной канал обновлений — сайт (`/installer`), установщик сверяет подпись сборки встроенным ключом автоматически.'
+          } > release-body.md
+
       - name: GitHub Release (exe + provenance)
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
@@ -374,21 +411,7 @@ jobs:
             provenance-${{ needs.build.outputs.version }}.zip
           fail_on_unmatched_files: true
           generate_release_notes: true
-          body: |
-            Установщик карт КрайКарт ${{ needs.build.outputs.version }}.
-
-            [Скачать установщик для Windows (x64)](${{ github.server_url }}/${{ github.repository }}/releases/download/${{ github.ref_name }}/${{ env.EXE }})
-
-            Архив `provenance-*.zip` — для проверки (подпись сборки + SHA-256).
-
-            Этот релиз собран и опубликован автоматически (CI) из исходников коммита тега — файлы приложены роботом, а не загружены человеком:
-            - коммит: ${{ github.sha }}
-            - прогон сборки: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            Как убедиться, что файл тот самый:
-            1. Сверь SHA-256 установщика с `SHA256SUMS.txt` из provenance-архива.
-            2. Основной канал обновлений — сайт (`/installer`), установщик сверяет подпись сборки встроенным ключом автоматически.
-            3. Вопросы — в issues репозитория.
+          body_path: release-body.md
 
       - name: Summary
         if: always()
