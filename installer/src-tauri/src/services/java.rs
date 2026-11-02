@@ -158,7 +158,7 @@ pub fn mc_needs_java21(mc: &str) -> bool {
 /// `None` — нет файла, не запустилась или повисла.
 pub fn java_major(exe: &Path) -> Option<u64> {
     use std::sync::mpsc;
-    let child = std::process::Command::new(exe)
+    let child = super::process::background_command(exe)
         .arg("-version")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

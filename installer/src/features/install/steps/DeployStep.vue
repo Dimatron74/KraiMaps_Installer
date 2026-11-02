@@ -6,13 +6,15 @@ import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
 import ProgressBar from '../../../shared/ui/ProgressBar.vue';
 import { formatBytes } from '../../../shared/utils/format';
+import CompatDetails from '../components/CompatDetails.vue';
 
 const store = useInstallStore();
 
-/** Порядок стадий деплоя: мир → моды → паки → слои. Провижининг загрузчика
- * (`installer-*`) идёт до деплоя и в счётчик не входит. */
+/** Порядок стадий деплоя: мир → слой совместимости → контент карты.
+ * Провижининг загрузчика (`installer-*`) идёт до деплоя и в счётчик не входит. */
 const activeStages = computed(() => {
   const list = ['world'];
+  if (store.compatInDeploy) list.push('compat-download', 'compat-apply');
   if (store.pack?.is_modded) list.push('mods');
   if (store.selectedResourcePacks().length > 0) list.push('resourcepacks');
   list.push('layers');
@@ -33,13 +35,15 @@ const isInstallerStage = computed(
  */
 const loaderLabel = computed(() => {
   const pack = store.pack;
-  if (!pack?.is_modded) return null;
-  const name = LOADER_NAMES[pack.loader];
-  return store.loaderVersion ? `${name} ${store.loaderVersion}` : name;
+  if (!pack) return null;
+  const loader = store.compat?.loader ?? pack.loader;
+  if (loader === 'vanilla') return null;
+  const name = LOADER_NAMES[loader];
+  const version = store.compat?.loader_version ?? store.loaderVersion;
+  return version ? `${name} ${version}` : name;
 });
 
 const stageName = computed(() => {
-  const pack = store.pack;
   const loader = loaderLabel.value;
   switch (store.progress?.stage) {
     case 'world':
@@ -50,11 +54,15 @@ const stageName = computed(() => {
       return 'Раскладываем настройки…';
     case 'resourcepacks':
       return 'Ставим ресурспаки…';
+    case 'compat-download':
+      return store.compat?.kind === 'optifine' ? 'Скачиваем OptiFine…' : 'Скачиваем сборку…';
+    case 'compat-apply':
+      return store.compat?.kind === 'optifine' ? 'Ставим OptiFine…' : 'Ставим сборку…';
     case 'installer-download':
       return loader ? `Качаем установщик ${loader}…` : 'Качаем установщик загрузчика…';
     case 'installer-run':
-      return loader && pack?.world_version
-        ? `Устанавливаем ${loader} для Minecraft ${pack.world_version}…`
+      return loader && store.targetMcVersion
+        ? `Устанавливаем ${loader} для Minecraft ${store.targetMcVersion}…`
         : 'Устанавливаем загрузчик…';
     case 'version-finalize':
       return 'Завершаем подготовку версии…';
@@ -76,8 +84,29 @@ const loaderHint = computed(() => {
   return `Установку выполняет официальный установщик${loader ? ` ${loader}` : ' загрузчика'}: он скачивает компоненты с серверов Mojang и разработчиков загрузчика, это безопасно и занимает несколько минут.`;
 });
 
+/** Плашка на время слоя: что именно ставим и зачем (только свежая цель). */
+const compatHint = computed(() => {
+  const compat = store.compat;
+  if (!compat) return null;
+  const stage = store.progress?.stage ?? '';
+  if (!isInstallerStage.value && (!store.compatInDeploy || !stage.startsWith('compat-'))) {
+    return null;
+  }
+  return compat.kind === 'optifine'
+    ? 'Ставим Forge и OptiFine — карте нужен OptiFine.'
+    : 'Ставим Fabulously Optimized — сборка на Fabric, это современная рекомендуемая замена OptiFine.';
+});
+
 const logOpen = ref(false);
 const logBox = ref<HTMLElement | null>(null);
+
+const unknownCompatWork = computed(() => {
+  const summary = store.compat;
+  if (!summary) return false;
+  if (store.progress?.stage === 'compat-download') return summary.total_bytes === null;
+  if (store.progress?.stage === 'compat-apply') return summary.apply_bytes === null;
+  return false;
+});
 
 /** Держим хвост лога в виду — иначе «подробнее» показывает начало установки. */
 watch(
@@ -95,7 +124,7 @@ watch(
  */
 const percent = computed(() => {
   const p = store.progress;
-  if (!p) return null;
+  if (!p || unknownCompatWork.value) return null;
   if (p.overall_total) {
     return Math.min(100, ((p.overall_done ?? 0) / p.overall_total) * 100);
   }
@@ -113,6 +142,10 @@ const stageCounter = computed(() => {
 const mbLine = computed(() => {
   const p = store.progress;
   if (!p) return null;
+  if (unknownCompatWork.value) {
+    if (!p.done_bytes) return null;
+    return `${formatBytes(p.done_bytes)} ${p.stage === 'compat-download' ? 'скачано' : 'записано'}`;
+  }
   if (p.overall_total)
     return `${formatBytes(p.overall_done ?? 0)} из ${formatBytes(p.overall_total)}`;
   if (p.total_bytes > 0) {
@@ -136,6 +169,17 @@ const mbLine = computed(() => {
     <p v-if="loaderHint" class="mx-auto mt-2 max-w-md text-center text-xs text-secondary">
       {{ loaderHint }}
     </p>
+    <p v-if="compatHint" class="mx-auto mt-2 max-w-md text-center text-xs text-secondary">
+      {{ compatHint }}
+    </p>
+    <CompatDetails v-if="compatHint" :summary="store.compat" class="mx-auto max-w-md" />
+    <Alert v-if="store.compatUnavailable" tone="warning" class="mx-auto mt-3 max-w-md">
+      <p class="text-xs">{{ store.compatUnavailable }}</p>
+      <p v-if="store.compatPreparationFailure" class="mt-1 text-xs">
+        Карта установится без OptiFine.
+      </p>
+      <CompatDetails :summary="store.compat" :failure="store.compatPreparationFailure" />
+    </Alert>
     <div class="mx-auto mt-6 max-w-md">
       <ProgressBar
         :percent="percent"

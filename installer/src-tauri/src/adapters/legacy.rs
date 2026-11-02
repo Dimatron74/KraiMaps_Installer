@@ -319,8 +319,8 @@ pub async fn ensure_version(
         Some(vanilla::require_exact_loader_version(loader, loader_version)?)
     };
 
-    let dir_name = match loader {
-        LoaderKind::Vanilla => mc_version.to_string(),
+    let (dir_name, created) = match loader {
+        LoaderKind::Vanilla => (mc_version.to_string(), false),
         _ => {
             let loader_version = loader_version
                 .as_deref()
@@ -329,7 +329,7 @@ pub async fn ensure_version(
             match existing {
                 Some(found) => {
                     let _closed = close_legacy();
-                    found.dir_name
+                    (found.dir_name, false)
                 }
                 None => {
                     let _closed = close_legacy();
@@ -352,7 +352,7 @@ pub async fn ensure_version(
                         &marked,
                         &vanilla::family_of(mc_version, loader),
                     )?;
-                    marked
+                    (marked, true)
                 }
             }
         }
@@ -382,6 +382,7 @@ pub async fn ensure_version(
             loader_version,
         },
         mods_empty: vanilla::mods_empty(&target_dir),
+        created,
         preselected,
     })
 }

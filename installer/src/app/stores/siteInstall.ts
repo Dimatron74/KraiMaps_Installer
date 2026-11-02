@@ -136,9 +136,13 @@ export const useSiteInstallStore = defineStore('site-install', {
         // Мета манифеста — строго после pickZip (он делает reset стора).
         // Иконку pickZip уже достал из архива сам (общий путь обоих потоков).
         install.setSiteMeta(
-          manifest.loader
-            ? { loaderSlug: manifest.loader.slug, loaderVersion: manifest.loader.version }
-            : null,
+          {
+            loaderSlug: manifest.loader?.slug ?? null,
+            loaderVersion: manifest.loader?.version ?? null,
+            // Нужна, когда в архиве нет level.dat-версии: слой без версии
+            // MC не резолвится, а гадать запрещено.
+            minecraftPrimary: manifest.minecraft.primary?.trim() || null,
+          },
           manifest.title,
         );
         // pickZip перевёл визард на confirm/analyzing — дальше пользователь идёт сам.

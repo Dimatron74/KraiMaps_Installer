@@ -7,7 +7,9 @@
 //! - Мир пишется атомарно: `<Имя>.__install` → rename; замена запрещена.
 //! - Всё удалённое/заменённое — в `.kraimaps-backup/<дата>/`.
 
-use crate::domain::{resolve_unique_name, InstallError, ResourcePackKind, ResourcePackSelection};
+use crate::domain::{
+    resolve_unique_name, CompatReport, InstallError, ResourcePackKind, ResourcePackSelection,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -58,6 +60,10 @@ pub struct DeployPlan {
     /// `PackAnalysis.resource_packs` с галочек экрана проверки).
     #[serde(default)]
     pub resource_packs: Vec<ResourcePackSelection>,
+    /// План слоя совместимости. Фронт передаёт путь только для свежей цели;
+    /// бэкенд дополнительно требует пустую `mods/` (оборона в глубину).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat_plan_path: Option<String>,
 }
 
 /// Итог деплоя для экрана «Готово» и «Подробнее».
@@ -70,6 +76,10 @@ pub struct DeployReport {
     /// Финальные имена ресурспаков в `resourcepacks/` (папки и zip).
     #[serde(default)]
     pub resource_packs_written: Vec<String>,
+    /// Слой совместимости: успех или non-fatal причина. `None` — слой не
+    /// запрашивался (нет требования/существующая цель).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<CompatReport>,
 }
 
 impl StageEvent {
@@ -95,6 +105,7 @@ impl StageEvent {
 }
 
 pub type Progress<'a> = &'a (dyn Fn(StageEvent) + Send + Sync);
+pub type ProgressFn = std::sync::Arc<dyn Fn(StageEvent) + Send + Sync>;
 
 /// Порция между событиями прогресса внутри большого файла: чаще — спам
 /// в IPC, реже — полоса стоит на месте во время долгой записи.
@@ -120,6 +131,36 @@ struct StageWork {
 fn open_zip(zip_path: &Path) -> Result<zip::ZipArchive<std::fs::File>, InstallError> {
     let file = std::fs::File::open(zip_path).map_err(InstallError::ZipOpen)?;
     zip::ZipArchive::new(file).map_err(|e| InstallError::ZipCorrupt(e.to_string()))
+}
+
+/// Защита карты использует те же назначения, что и запись: иначе повтор
+/// слоя может перезаписать перенесённый datapack или файл мира после rename.
+pub fn content_paths(
+    plan: &DeployPlan,
+    world_dir_name: &str,
+) -> Result<Vec<String>, InstallError> {
+    let (world, _) = world_work(&plan.zip_path, &plan.world_prefix)?;
+    let mut paths: Vec<String> = world.into_iter()
+        .map(|item| format!("saves/{world_dir_name}/{}", item.rel))
+        .collect();
+    if plan.deploy_mods {
+        let (mods, _) = mods_work(&plan.zip_path, &plan.content_prefix)?;
+        paths.extend(mods.into_iter().map(|item| format!("mods/{}", item.rel)));
+    }
+    let (excluded_prefixes, excluded_files) = rp_exclusions(&plan.resource_packs);
+    let (layers, _) = layers_work(
+        &plan.zip_path,
+        &plan.world_prefix,
+        &plan.content_prefix,
+        plan.overrides_alias,
+        &excluded_prefixes,
+        &excluded_files,
+        world_dir_name,
+    )?;
+    paths.extend(layers.into_iter().map(|item| item.rel));
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// Пишет запись в файл назначения, считая байты. События — порциями
@@ -161,6 +202,10 @@ pub struct StageTotals {
     pub mods: u64,
     pub resourcepacks: u64,
     pub layers: u64,
+    /// Байты слоя совместимости; `None` — размер неизвестен (OptiFine).
+    /// Неизвестная стадия исключается из общего знаменателя.
+    pub compat: Option<u64>,
+    pub compat_apply: Option<u64>,
 }
 
 impl StageTotals {
@@ -168,6 +213,8 @@ impl StageTotals {
     pub fn overall(&self, deploy_mods: bool, has_resourcepacks: bool) -> u64 {
         self.world
             + self.layers
+            + self.compat.unwrap_or(0)
+            + self.compat_apply.unwrap_or(0)
             + if deploy_mods { self.mods } else { 0 }
             + if has_resourcepacks {
                 self.resourcepacks
@@ -180,7 +227,11 @@ impl StageTotals {
 /// Байтовые итоги всех стадий плана (один проход классификаторов,
 /// без записи). Размеры не зависят от имён назначения, поэтому для layers
 /// достаточно запрошенного имени мира из плана.
-pub fn stage_totals(plan: &DeployPlan) -> Result<StageTotals, InstallError> {
+pub fn stage_totals(
+    plan: &DeployPlan,
+    compat_bytes: Option<u64>,
+    compat_apply_bytes: Option<u64>,
+) -> Result<StageTotals, InstallError> {
     let (_, world) = world_work(&plan.zip_path, &plan.world_prefix)?;
     let (_, mods) = mods_work(&plan.zip_path, &plan.content_prefix)?;
     let mut resourcepacks = 0u64;
@@ -205,6 +256,8 @@ pub fn stage_totals(plan: &DeployPlan) -> Result<StageTotals, InstallError> {
         mods,
         resourcepacks,
         layers,
+        compat: compat_bytes,
+        compat_apply: compat_apply_bytes,
     })
 }
 
@@ -579,12 +632,21 @@ pub fn deploy_resourcepacks(
     packs: &[ResourcePackSelection],
     resourcepacks_dir: &Path,
     progress: Progress,
+    record_destination: &mut dyn FnMut(&str),
 ) -> Result<Vec<String>, InstallError> {
     use crate::domain::resolve_resourcepack_name;
     std::fs::create_dir_all(resourcepacks_dir)?;
     let mut written: Vec<String> = Vec::new();
 
     let mut archive = open_zip(zip_path)?;
+    let total = packs.iter().try_fold(0u64, |total, pack| {
+        let size = match pack.kind {
+            ResourcePackKind::Folder => rp_folder_work(zip_path, &pack.source)?.1,
+            ResourcePackKind::Zip => rp_zip_work(zip_path, &pack.source)?.size,
+        };
+        Ok::<_, InstallError>(total.saturating_add(size))
+    })?;
+    let mut done = 0u64;
 
     for pack in packs {
         match pack.kind {
@@ -592,13 +654,13 @@ pub fn deploy_resourcepacks(
                 let final_name = resolve_resourcepack_name(&pack.name, pack.kind, &|n| {
                     resourcepacks_dir.join(n).exists()
                 });
+                record_destination(&final_name);
                 let staging = resourcepacks_dir.join(format!("{final_name}.__install"));
                 if staging.exists() {
                     std::fs::remove_dir_all(&staging)?;
                 }
                 std::fs::create_dir_all(&staging)?;
-                let (work, total) = rp_folder_work(zip_path, &pack.source)?;
-                let mut done = 0u64;
+                let (work, _) = rp_folder_work(zip_path, &pack.source)?;
                 for item in &work {
                     if item.is_dir {
                         // Пустые папки пака сохраняем как есть (вес нулевой).
@@ -634,6 +696,7 @@ pub fn deploy_resourcepacks(
                 let final_name = resolve_resourcepack_name(&pack.name, pack.kind, &|n| {
                     resourcepacks_dir.join(n).exists()
                 });
+                record_destination(&final_name);
                 let item = rp_zip_work(zip_path, &pack.source)?;
                 let mut entry = archive
                     .by_index(item.index)
@@ -642,7 +705,6 @@ pub fn deploy_resourcepacks(
                     return Err(InstallError::ZipSlip(pack.source.clone()));
                 }
                 let dest = resourcepacks_dir.join(&final_name);
-                let mut done = 0u64;
                 copy_counted(
                     &mut entry,
                     &dest,
@@ -650,7 +712,7 @@ pub fn deploy_resourcepacks(
                     "resourcepacks",
                     &final_name,
                     &mut done,
-                    item.size,
+                    total,
                 )?;
                 written.push(final_name);
             }
@@ -863,6 +925,98 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
 
     fn noop_progress(_: StageEvent) {}
 
+    fn content_plan(zip: &Path, world_prefix: &str, content_prefix: &str) -> DeployPlan {
+        DeployPlan {
+            zip_path: zip.to_path_buf(),
+            world_prefix: world_prefix.into(),
+            world_name: "World".into(),
+            content_prefix: content_prefix.into(),
+            overrides_alias: false,
+            layers: Vec::new(),
+            deploy_mods: true,
+            wipe_mods: false,
+            resource_packs: Vec::new(),
+            compat_plan_path: None,
+        }
+    }
+
+    #[test]
+    fn content_paths_follow_datapack_routing_into_the_actual_world_name() {
+        let root = temp_root("content-datapack-routing");
+        let zip = root.join("map.zip");
+        write_zip(&zip, &[
+            ("Wrapped/saves/World/level.dat", b"level"),
+            ("Wrapped/datapacks/story/data/map/functions/start.mcfunction", b"map"),
+        ]);
+
+        let plan = content_plan(&zip, "Wrapped/saves/World/", "Wrapped/");
+        let paths = content_paths(&plan, "World_v2").expect("paths");
+
+        assert!(paths.contains(&"saves/World_v2/datapacks/story/data/map/functions/start.mcfunction".to_string()), "{paths:?}");
+        assert!(!paths.contains(&"datapacks/story/data/map/functions/start.mcfunction".to_string()));
+    }
+
+    #[test]
+    fn content_paths_exclude_unselected_mods_and_loose_resourcepack_sources() {
+        let root = temp_root("content-selected-work");
+        let zip = root.join("map.zip");
+        write_zip(&zip, &[
+            ("W/level.dat", b"level"),
+            ("mods/custom.jar", b"mod"),
+            ("Story/pack.mcmeta", b"pack"),
+            ("config/map.txt", b"map"),
+        ]);
+        let plan = DeployPlan {
+            zip_path: zip,
+            world_prefix: "W/".into(),
+            world_name: "W".into(),
+            content_prefix: String::new(),
+            overrides_alias: false,
+            layers: Vec::new(),
+            deploy_mods: false,
+            wipe_mods: false,
+            resource_packs: vec![ResourcePackSelection {
+                source: "Story/".into(),
+                name: "Story".into(),
+                kind: ResourcePackKind::Folder,
+            }],
+            compat_plan_path: None,
+        };
+
+        let paths = content_paths(&plan, "W").expect("paths");
+
+        assert_eq!(paths, vec!["config/map.txt", "saves/W/level.dat"]);
+    }
+
+    #[test]
+    fn content_paths_cover_content_and_world() {
+        let root = temp_root("content-paths");
+        let zip = root.join("map.zip");
+        write_zip(
+            &zip,
+            &[
+                ("W/saves/MyWorld/level.dat", b"fake-level"),
+                ("W/saves/MyWorld/region/r.mca", b"region"),
+                ("W/config/a.txt", b"a"),
+                ("W/mods/mod.jar", b"jar"),
+                ("W/options.txt", b"options"),
+            ],
+        );
+        let plan = content_plan(&zip, "W/saves/MyWorld/", "W/");
+        let paths = content_paths(&plan, "MyWorld").expect("paths");
+        assert!(paths.contains(&"config/a.txt".to_string()), "{paths:?}");
+        assert!(paths.contains(&"options.txt".to_string()), "{paths:?}");
+        assert!(paths.contains(&"mods/mod.jar".to_string()), "{paths:?}");
+        assert!(
+            paths.contains(&"saves/MyWorld/level.dat".to_string()),
+            "{paths:?}"
+        );
+        assert!(
+            paths.contains(&"saves/MyWorld/region/r.mca".to_string()),
+            "{paths:?}"
+        );
+    }
+
     /// Регрессия «полоса в начале при 78%»: прогресс стадий идёт в несжатых
     /// байтах (а не в номерах записей), монотонно 0 → total. Тысяча мелких
     /// datapack-файлов больше не перевешивает один большой region-файл.
@@ -934,8 +1088,9 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
             deploy_mods: true,
             wipe_mods: false,
             resource_packs: Vec::new(),
+            compat_plan_path: None,
         };
-        let totals = stage_totals(&plan).expect("totals");
+        let totals = stage_totals(&plan, None, None).expect("totals");
         assert_eq!(totals.world, b"fake-level".len() as u64);
         assert_eq!(totals.mods, b"jar-bytes".len() as u64);
         assert_eq!(totals.resourcepacks, 0);
@@ -1277,6 +1432,42 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
     }
 
     #[test]
+    fn resourcepack_destinations_are_recorded_before_writing_the_resolved_name() {
+        let root = temp_root("rp-resolved-protection");
+        let zip = root.join("map.zip");
+        write_zip(&zip, &[("Story/pack.mcmeta", b"map"), ("Extra/Story.zip", b"zip")]);
+        let rps = root.join("resourcepacks");
+        std::fs::create_dir_all(rps.join("Story")).expect("existing folder");
+        std::fs::write(rps.join("Story.zip"), b"existing zip").expect("existing zip");
+        let packs = vec![folder_selection("Story", "Story/"), zip_selection("Story.zip", "Extra/Story.zip")];
+        let mut recorded = Vec::new();
+
+        let written = deploy_resourcepacks(&zip, &packs, &rps, &noop_progress, &mut |name| {
+            assert!(!rps.join(name).exists(), "destination must be protected before its first write");
+            recorded.push(name.to_string());
+        }).expect("packs");
+
+        assert_eq!(recorded, vec!["Story_v2", "Story_v2.zip"]);
+        assert_eq!(written, vec!["Story_v2", "Story_v2.zip"]);
+    }
+
+    #[test]
+    fn resourcepack_progress_is_cumulative_across_folder_and_zip_packs() {
+        let root = crate::test_utils::TempDir::new("rp-cumulative-progress");
+        let zip = root.join("map.zip");
+        write_zip(&zip, &[("First/pack.mcmeta", b"first"), ("Second/pack.zip", b"zip")]);
+        let packs = [folder_selection("First", "First/"), zip_selection("Second.zip", "Second/pack.zip")];
+        let events = std::sync::Mutex::new(Vec::new());
+
+        deploy_resourcepacks(&zip, &packs, &root.join("resourcepacks"),
+            &|ev| events.lock().expect("events").push(ev), &mut |_| {}).expect("packs");
+
+        let events = events.into_inner().expect("events");
+        assert_eq!(events.iter().map(|ev| ev.total_bytes).collect::<Vec<_>>(), vec![8, 8]);
+        assert_eq!(events.iter().map(|ev| ev.done_bytes).collect::<Vec<_>>(), vec![5, 8]);
+    }
+
+    #[test]
     fn resourcepack_folder_deploys_to_resourcepacks_without_root_duplicate() {
         // MOTD2-кейс: loose-папка едет в resourcepacks/, дубля в корне игры нет.
         let root = temp_root("looserp");
@@ -1299,6 +1490,7 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
             &packs,
             &game.join("resourcepacks"),
             &noop_progress,
+            &mut |_| {},
         )
         .expect("rps");
         assert_eq!(written, ["RP"]);
@@ -1342,7 +1534,7 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
         std::fs::create_dir_all(rps.join("RP")).expect("existing");
 
         let written =
-            deploy_resourcepacks(&zip, &[folder_selection("RP", "RP/")], &rps, &noop_progress)
+            deploy_resourcepacks(&zip, &[folder_selection("RP", "RP/")], &rps, &noop_progress, &mut |_| {})
                 .expect("rps");
         assert_eq!(written, ["RP_v2"]);
         assert!(rps.join("RP_v2/pack.mcmeta").is_file());
@@ -1366,6 +1558,7 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
             &[zip_selection("Cute.zip", "Extra/Cute.zip")],
             &rps,
             &noop_progress,
+            &mut |_| {},
         )
         .expect("rps");
         assert_eq!(written, ["Cute.zip"]);
@@ -1380,6 +1573,7 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
             &[zip_selection("Cute.zip", "Extra/Cute.zip")],
             &rps,
             &noop_progress,
+            &mut |_| {},
         )
         .expect("rps");
         assert_eq!(again, ["Cute_v2.zip"]);

@@ -1,6 +1,8 @@
 /** Типизированные обёртки над Tauri-командами (src-tauri/src/commands.rs). */
 import { Channel, invoke } from '@tauri-apps/api/core';
 import type {
+  CompatReport,
+  CompatSummary,
   Detection,
   DeployPlan,
   DeployReport,
@@ -10,6 +12,7 @@ import type {
   LoaderKind,
   PackAnalysis,
   ResourcePackKind,
+  StageEvent,
 } from '../types/installer';
 import type {
   EntitlementResponse,
@@ -152,8 +155,41 @@ export const api = {
     return invoke('resource_pack_icon', { zipPath, source, kind });
   },
 
-  deployPack(target: GameTarget, plan: DeployPlan): Promise<DeployReport> {
-    return invoke('deploy_pack', { target, plan });
+  deployPack(
+    target: GameTarget,
+    plan: DeployPlan,
+    compat: CompatSummary | null,
+  ): Promise<DeployReport> {
+    return invoke('deploy_pack', { target, plan, compat });
+  },
+
+  /**
+   * Подготовка слоя совместимости (OptiFine): резолв ветки, скачивание
+   * `.mrpack` и разбор индекса. `E_COMPAT_UNAVAILABLE` — не ошибка экрана:
+   * карта ставится без слоя, причина показывается в UI.
+   */
+  prepareCompat(mcVersion: string | null, isModded: boolean): Promise<CompatSummary> {
+    return invoke('prepare_compat', { mcVersion, isModded });
+  },
+
+  /** Повтор слоя в уже созданной свежей цели: мир не переустанавливается. */
+  async applyCompat(
+    target: GameTarget,
+    summary: CompatSummary,
+    onProgress: (event: StageEvent) => void,
+  ): Promise<CompatReport> {
+    const channel = new Channel<StageEvent>();
+    channel.onmessage = onProgress;
+    try {
+      return await invoke('apply_compat', { target, summary, onProgress: channel });
+    } finally {
+      channel.onmessage = () => {};
+    }
+  },
+
+  /** Удаление плана слоя и его `.mrpack` после ухода с «Готово»/сброса. */
+  discardCompat(planPath: string): Promise<number> {
+    return invoke('discard_compat', { planPath });
   },
 
   /**

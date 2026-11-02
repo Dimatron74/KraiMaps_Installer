@@ -166,6 +166,14 @@ mod tests {
     }
 
     #[test]
+    fn optifine_marker_is_not_a_loader_version() {
+        // Сайт шлёт `loader.version = "optifine"` — это требование слоя
+        // совместимости, а не версия загрузчика: хинтом его брать нельзя,
+        // иначе инстанс создастся с несуществующей версией.
+        assert!(!is_exact_version("optifine"));
+    }
+
+    #[test]
     fn forge_prefers_recommended_over_latest() {
         let doc: serde_json::Value = serde_json::from_str(
             r#"{"promos": {"1.18.2-recommended": "40.2.0", "1.18.2-latest": "40.3.12"}}"#,

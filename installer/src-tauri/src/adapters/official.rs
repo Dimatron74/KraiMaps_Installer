@@ -251,17 +251,47 @@ fn encode_png_exact(img: &image::DynamicImage) -> Vec<u8> {
     cursor.into_inner()
 }
 
-/// Создание нашей установки: собственная папка игры под карту, свой id,
-/// своя иконка. Существующие установки пользователя не трогаем.
-///
-/// Каждый вызов создаёт НОВУЮ установку. Молча переписывать прошлую нельзя:
-/// пользователь нажал «создать установку» и получил бы ту же папку, а мир
-/// ушёл бы в неё же — выглядело бы как «ничего не создалось». Занятое имя
-/// разрешает вызывающий ([`ensure_installation`]): «DeepMine 1.21.11» →
-/// «DeepMine 1.21.11_v2», и у него своя папка.
-///
-/// Поле `gameDir` — обязательное: без него лаунчер запускает установку в
-/// корне `.minecraft` и наша папка остаётся невидимой.
+fn installation_path_key(path: &Path) -> String {
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = absolute.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        key.replace('\\', "/").to_lowercase()
+    } else {
+        key
+    }
+}
+
+fn reserve_installation_dir(
+    data_dir: &Path,
+    display_name: &str,
+    profiles: &serde_json::Map<String, serde_json::Value>,
+) -> Result<PathBuf, InstallError> {
+    let parent = data_dir.join(INSTALL_DIR_NAME);
+    std::fs::create_dir_all(&parent)?;
+    let base = crate::domain::slugify(display_name);
+    let mut taken: std::collections::HashSet<String> = profiles.values()
+        .filter_map(|profile| profile.get("gameDir").and_then(|value| value.as_str()))
+        .filter(|path| !path.is_empty())
+        .map(|path| installation_path_key(Path::new(path)))
+        .collect();
+    loop {
+        let name = crate::domain::resolve_unique_name(&base, &|name| {
+            taken.contains(&installation_path_key(&installation_dir(data_dir, name)))
+        });
+        let directory = installation_dir(data_dir, &name);
+        // Разные имена профилей дают одинаковый slug; только create_dir доказывает свежесть.
+        match std::fs::create_dir(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                taken.insert(installation_path_key(&directory));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+/// Без `gameDir` лаунчер запускает профиль в общей `.minecraft`.
+/// Успех требует новой папки: только такой профиль допустим для слоя совместимости.
 pub fn create_installation(
     data_dir: &Path,
     display_name: &str,
@@ -272,8 +302,11 @@ pub fn create_installation(
     let mut doc = read_json(&profiles_path).ok_or(InstallError::NoDataDir {
         launcher: "Minecraft Launcher (нет launcher_profiles.json)".to_string(),
     })?;
-    let game_dir = installation_dir(data_dir, display_name);
-    std::fs::create_dir_all(&game_dir)?;
+    let obj = doc
+        .get_mut("profiles")
+        .and_then(|p| p.as_object_mut())
+        .ok_or_else(|| InstallError::ModrinthSchema("в profiles нет объекта".to_string()))?;
+    let game_dir = reserve_installation_dir(data_dir, display_name, obj)?;
     let game_dir_str = game_dir.to_string_lossy().into_owned();
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -293,11 +326,6 @@ pub fn create_installation(
             profile["icon"] = json!("Grass");
         }
     }
-    let obj = doc
-        .get_mut("profiles")
-        .and_then(|p| p.as_object_mut())
-        .ok_or_else(|| InstallError::ModrinthSchema("в profiles нет объекта".to_string()))?;
-
     // 32 hex — формат id лаунчера; генерируем свободный.
     let mut seed = uuid::Uuid::new_v4().simple().to_string();
     while obj.contains_key(&seed) {
@@ -390,14 +418,7 @@ pub fn add_quick_play(
     Ok(quick_play_enabled(data_dir))
 }
 
-/// Подготовка версии и нашей установки под карту.
-/// Имя новой установки без конфликтов с уже существующими.
-///
-/// Занятое имя не мешает: установок у лаунчера сколько угодно, а папка игры
-/// выводится из имени, поэтому «DeepMine 1.21.11» → «DeepMine 1.21.11_v2» и
-/// у него своя папка. Регистр игнорируем: «DeepMine 1.21.11» и
-/// «deepmine 1.21.11» в списке лаунчера выглядят как дубль, а не как две
-/// разные установки.
+/// Регистр не различает имена в списке лаунчера; gameDir резервируется отдельно.
 fn unique_installation_name(data_dir: &Path, base: &str) -> String {
     let taken: Vec<String> = read_installations(data_dir)
         .into_iter()
@@ -442,9 +463,6 @@ pub async fn ensure_installation(
         }
     };
 
-    // У установок, в отличие от папок `versions/`, сколько угодно — лаунчер
-    // различает их по `gameDir`, а он выводится из имени. Поэтому занятое имя
-    // не мешает: получаем новую установку с суффиксом и своей папкой.
     let inst = create_installation(
         data_dir,
         &unique_installation_name(data_dir, display_name),
@@ -462,6 +480,7 @@ pub async fn ensure_installation(
             loader_version: loader_version.map(|s| s.to_string()),
         },
         mods_empty: vanilla::mods_empty(&game_dir),
+        created: true,
         // У официального лаунчера нет конфига с выбором версии: свежий
         // `lastUsed` в только что созданной установке заставляет лаунчер
         // выбрать её самому.
@@ -715,6 +734,53 @@ mod tests {
         );
         // Одна исходная из `make_data_dir` + две наши.
         assert_eq!(read_installations(&mc).len(), 3);
+    }
+
+    #[test]
+    fn create_installation_does_not_reuse_a_game_dir_when_names_share_a_slug() {
+        let root = temp_root("slug-collision");
+        let mc = make_data_dir(&root);
+        let first = create_installation(&mc, "AB 1.21.11", "1.21.11", None).expect("first");
+        let old_game = first.dir_in(&mc);
+        std::fs::create_dir(old_game.join("config")).expect("old config");
+        std::fs::write(old_game.join("config/options.txt"), b"user settings").expect("user data");
+
+        let second = create_installation(&mc, "A B 1.21.11", "1.21.11", None).expect("second");
+
+        assert_ne!(second.dir_in(&mc), old_game, "a new profile must have a fresh game directory");
+        assert_eq!(std::fs::read(old_game.join("config/options.txt")).expect("old data"), b"user settings");
+        assert_eq!(std::fs::read_dir(second.dir_in(&mc)).expect("new directory").count(), 0);
+    }
+
+    #[test]
+    fn create_installation_preserves_an_orphan_game_directory() {
+        let root = temp_root("orphan-collision");
+        let mc = make_data_dir(&root);
+        let orphan = mc.join("KraiMaps/Map12111");
+        std::fs::create_dir_all(orphan.join("saves/Played")).expect("orphan world");
+        std::fs::write(orphan.join("saves/Played/level.dat"), b"player progress").expect("world data");
+
+        let created = create_installation(&mc, "Map 1.21.11", "1.21.11", None).expect("create");
+
+        assert_ne!(created.dir_in(&mc), orphan, "an unlisted directory is still user data");
+        assert_eq!(std::fs::read(orphan.join("saves/Played/level.dat")).expect("user world"), b"player progress");
+        assert_eq!(std::fs::read_dir(created.dir_in(&mc)).expect("new directory").count(), 0);
+    }
+
+    #[test]
+    fn create_installation_does_not_claim_a_missing_directory_assigned_to_another_profile() {
+        let root = temp_root("missing-claimed-collision");
+        let mc = make_data_dir(&root);
+        let first = create_installation(&mc, "AB 1.21.11", "1.21.11", None).expect("first");
+        let claimed = first.dir_in(&mc);
+        std::fs::remove_dir(&claimed).expect("profile directory not yet populated");
+
+        let second = create_installation(&mc, "A B 1.21.11", "1.21.11", None).expect("second");
+
+        assert_ne!(second.dir_in(&mc), claimed, "the old profile must not share our directory later");
+        assert!(!claimed.exists());
+        let kept = read_installations(&mc).into_iter().find(|item| item.id == first.id).expect("old profile");
+        assert_eq!(kept.dir_in(&mc), claimed);
     }
 
     /// Регистр не различает: в списке лаунчера такие имена выглядят дублем.

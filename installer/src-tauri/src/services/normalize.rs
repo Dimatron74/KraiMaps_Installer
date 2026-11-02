@@ -4,7 +4,10 @@
 //! `.mrpack`-файла. Анализ только читает центральный каталог архива
 //! (без распаковки на диск), находит `level.dat`, классифицирует слои.
 
-use crate::domain::{InstallError, LoaderKind, ModInfo, PackAnalysis, ResourcePackInfo, ResourcePackKind};
+use crate::domain::{
+    GameTarget, InstallError, LauncherKind, LoaderKind, ModInfo, PackAnalysis, ResourcePackInfo,
+    ResourcePackKind,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -1033,6 +1036,21 @@ pub fn prism_game_root(instance_dir: &Path) -> PathBuf {
         }
     }
     instance_dir.join("minecraft")
+}
+
+/// Корень игры выбранной цели: единая точка правды для деплоя и слоя
+/// совместимости (Modrinth/TLauncher/Legacy/official — сам game dir).
+pub fn game_root(target: &GameTarget) -> PathBuf {
+    match target.launcher {
+        LauncherKind::Prism
+        | LauncherKind::Pinecone
+        | LauncherKind::Polymc
+        | LauncherKind::Multimc => prism_game_root(&target.path),
+        LauncherKind::Modrinth
+        | LauncherKind::Tlauncher
+        | LauncherKind::Legacy
+        | LauncherKind::Official => target.path.clone(),
+    }
 }
 
 #[cfg(test)]

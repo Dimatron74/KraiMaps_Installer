@@ -77,6 +77,25 @@ pub enum InstallError {
     /// Обновления: скачивание или установка сборки не удалась.
     #[error("не удалось установить обновление")]
     UpdateInstallFailed(String),
+    /// Слой совместимости: не удалось определить сборку/страницу (нет версии
+    /// для этой MC, API/сайт не ответили). Non-fatal для карты.
+    #[error("не удалось подобрать сборку совместимости")]
+    CompatResolve(String),
+    /// Слой совместимости: HTTP-ошибка после ретраев (429/503, обрыв).
+    #[error("не удалось скачать сборку совместимости")]
+    CompatDownload(String),
+    /// Слой совместимости: сервер перестал отдавать данные (нулевая скорость).
+    #[error("скачивание сборки совместимости остановилось")]
+    CompatStalled(String),
+    /// Слой совместимости: хеш/размер/ZIP/путь не сошлись.
+    #[error("сборка совместимости не прошла проверку")]
+    CompatInvalid(String),
+    /// Слой совместимости: не удалось записать файлы в цель.
+    #[error("не удалось применить сборку совместимости")]
+    CompatApply(String),
+    /// Слоя совместимости нет ни в одном варианте для этой MC.
+    #[error("сборка совместимости недоступна")]
+    CompatUnavailable(String),
     #[error("ошибка файловой системы")]
     Io(#[from] std::io::Error),
     #[error("ошибка базы данных")]
@@ -125,6 +144,12 @@ impl InstallError {
             Self::UpdateCheckFailed(_) => "E_UPDATE_CHECK",
             Self::UpdateSignature(_) => "E_UPDATE_SIGNATURE",
             Self::UpdateInstallFailed(_) => "E_UPDATE_INSTALL",
+            Self::CompatResolve(_) => "E_COMPAT_RESOLVE",
+            Self::CompatDownload(_) => "E_COMPAT_DOWNLOAD",
+            Self::CompatStalled(_) => "E_COMPAT_STALLED",
+            Self::CompatInvalid(_) => "E_COMPAT_INVALID",
+            Self::CompatApply(_) => "E_COMPAT_APPLY",
+            Self::CompatUnavailable(_) => "E_COMPAT_UNAVAILABLE",
             Self::Io(_) => "E_IO",
             Self::Db(_) => "E_DB",
         }
@@ -156,6 +181,12 @@ impl InstallError {
             Self::UpdateCheckFailed(ctx) => format!("updates check: {ctx}"),
             Self::UpdateSignature(ctx) => format!("updates signature: {ctx}"),
             Self::UpdateInstallFailed(ctx) => format!("updates install: {ctx}"),
+            Self::CompatResolve(ctx) => format!("compat resolve: {ctx}"),
+            Self::CompatDownload(ctx) => format!("compat download: {ctx}"),
+            Self::CompatStalled(ctx) => format!("compat stalled: {ctx}"),
+            Self::CompatInvalid(ctx) => format!("compat invalid: {ctx}"),
+            Self::CompatApply(ctx) => format!("compat apply: {ctx}"),
+            Self::CompatUnavailable(ctx) => format!("compat unavailable: {ctx}"),
             Self::Io(e) => format!("io: {e}"),
             Self::Db(e) => format!("db: {e}"),
             _ => self.code().to_string(),
@@ -169,7 +200,7 @@ impl InstallError {
 /// официальный Minecraft Launcher (у него «Установки» — профили в
 /// `launcher_profiles.json` со своей папкой игры) и два лаунчера без инстансов
 /// (TLauncher и Legacy Launcher: версии в `versions/`, общий движок — `adapters/vanilla`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LauncherKind {
     Prism,
@@ -183,7 +214,7 @@ pub enum LauncherKind {
 }
 
 /// Загрузчик модов. `Vanilla` — мир без модов (живёт в любом инстансе).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LoaderKind {
     Vanilla,
@@ -191,6 +222,181 @@ pub enum LoaderKind {
     Forge,
     Quilt,
     NeoForge,
+}
+
+/// Слой совместимости для карты, требующей OptiFine.
+/// OptiFine не является загрузчиком (это патч), поэтому отдельный тип:
+/// в `LoaderKind` его класть нельзя — резолв версии загрузчика сломался бы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompatKind {
+    /// Fabulously Optimized — Fabric-сборка с аналогами OptiFine (MC ≥ 1.16.5).
+    #[serde(rename = "fo")]
+    FabulouslyOptimized,
+    /// Forge + официальный OptiFine jar с optifine.net (MC ≤ 1.16.4).
+    #[serde(rename = "optifine")]
+    OptifineForge,
+}
+
+/// Один файл `.mrpack`-индекса, уже проверенный при подготовке плана.
+/// Пути и URL перепроверяются при применении: план — данные, а не код.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompatFile {
+    /// Относительный путь внутри корня игры (`mods/foo.jar`).
+    pub path: String,
+    pub url: String,
+    pub size: u64,
+    pub sha512: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha1: Option<String>,
+}
+
+/// Параметры OptiFine-ветки: имя файла на optifine.net и точная версия Forge
+/// со страницы (build `#2847` уже отрезолвлен в полную).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OptifinePlan {
+    pub file_name: String,
+    pub forge_version: String,
+}
+
+/// Полный план слоя, который живёт в приватном temp между подготовкой
+/// и деплоем (фронт носит только путь). Секретов (токенов) здесь нет.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatPlan {
+    pub schema: u32,
+    pub kind: CompatKind,
+    pub mc_version: String,
+    pub display_name: String,
+    pub version: String,
+    pub loader: LoaderKind,
+    pub loader_version: String,
+    /// Сумма размеров файлов; `None` — размер неизвестен до скачивания.
+    pub total_bytes: Option<u64>,
+    /// FO: путь к проверенному `.mrpack` в нашем temp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrpack_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_sha512: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pack_size: Option<u64>,
+    #[serde(default)]
+    pub files: Vec<CompatFile>,
+    /// Пути из `overrides/` и `client-overrides/` (без содержимого): по ним
+    /// проверяется, что `mods/` цели принадлежит слою, а не пользователю.
+    #[serde(default)]
+    pub overrides: Vec<String>,
+    /// Пути, которые принадлежат контенту карты. Слой не перезаписывает их:
+    /// приоритет карты выше `overrides` сборки — в том числе при повторе.
+    #[serde(default)]
+    pub protected_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optifine: Option<OptifinePlan>,
+    /// Причина fallback-ветки (напр. FO недоступен — ставим Forge + OptiFine).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+pub const COMPAT_PLAN_SCHEMA: u32 = 1;
+
+/// Лёгкая сводка для фронта: без списка файлов и без токенов.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatSummary {
+    pub kind: CompatKind,
+    pub display_name: String,
+    pub version: String,
+    pub loader: LoaderKind,
+    pub loader_version: String,
+    pub mc_version: String,
+    pub total_bytes: Option<u64>,
+    pub files_count: usize,
+    #[serde(default)]
+    pub apply_bytes: Option<u64>,
+    pub plan_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// Non-fatal сбой слоя: карта уже установлена, пользователь видит причину.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatFailure {
+    pub code: String,
+    pub message: String,
+    pub details: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompatReport {
+    /// `None` — план не удалось прочитать; сводка у фронта всё равно есть.
+    pub kind: Option<CompatKind>,
+    pub display_name: String,
+    pub version: String,
+    pub files_written: usize,
+    /// SHA-256 jar OptiFine: официальных контрольных сумм нет, поэтому
+    /// показываем посчитанную нами в «Подробнее».
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jar_sha256: Option<String>,
+    pub error: Option<CompatFailure>,
+}
+
+impl CompatReport {
+    pub fn failed(
+        kind: Option<CompatKind>,
+        display_name: String,
+        version: String,
+        error: CompatFailure,
+    ) -> Self {
+        Self {
+            kind,
+            display_name,
+            version,
+            files_written: 0,
+            jar_sha256: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// Числовые компоненты версии Minecraft (`"1.20.1"` → `[1, 20, 1]`).
+/// Снапшоты (`"23w45a"`) и мусор дают `None`: угадывать версию запрещено.
+pub fn mc_version_known(v: &str) -> bool {
+    mc_version_parts(v).is_some()
+}
+
+fn mc_version_parts(v: &str) -> Option<Vec<u64>> {
+    let v = v.trim().trim_start_matches(['v', 'V']);
+    if v.is_empty() {
+        return None;
+    }
+    v.split('.')
+        .map(|p| {
+            if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+                None
+            } else {
+                p.parse::<u64>().ok()
+            }
+        })
+        .collect()
+}
+
+fn cmp_mc_parts(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    let len = a.len().max(b.len());
+    for i in 0..len {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        match x.cmp(&y) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// `mc <= bound` по числам (не строкам). Неизвестная версия — `false`:
+/// политика «не гадать», вызывающий сам решает, что показать.
+pub fn mc_version_le(mc: &str, bound: &str) -> bool {
+    match (mc_version_parts(mc), mc_version_parts(bound)) {
+        (Some(a), Some(b)) => cmp_mc_parts(&a, &b) != std::cmp::Ordering::Greater,
+        _ => false,
+    }
 }
 
 /// Игровая цель: инстанс/профиль, куда можно ставить карту.
@@ -532,6 +738,63 @@ mod tests {
         assert_eq!(
             InstallError::ProvisionFailed("installer failed".to_string()).code(),
             "E_PROVISION_FAILED"
+        );
+    }
+
+    #[test]
+    fn mc_versions_compare_numerically_not_lexically() {
+        // Строковое сравнение сломало бы "1.7.10" vs "1.16.4" и "1.9" vs "1.16".
+        assert!(mc_version_le("1.16.4", "1.16.4"));
+        assert!(mc_version_le("1.7.10", "1.16.4"));
+        assert!(mc_version_le("1.8.9", "1.16.4"));
+        assert!(mc_version_le("1.16", "1.16.4"));
+        assert!(!mc_version_le("1.16.5", "1.16.4"));
+        assert!(!mc_version_le("1.20.1", "1.16.4"));
+        // Численно 1.9 < 1.16.4, хотя строкой "1.9" > "1.16.4".
+        assert!(mc_version_le("1.9", "1.16.4"));
+
+        // Снапшоты и мусор не угадываем: неизвестная версия — false.
+        assert!(!mc_version_le("23w45a", "1.16.4"));
+        assert!(!mc_version_le("", "1.16.4"));
+    }
+
+    #[test]
+    fn compat_kinds_use_stable_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&CompatKind::FabulouslyOptimized).expect("json"),
+            "\"fo\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CompatKind::OptifineForge).expect("json"),
+            "\"optifine\""
+        );
+    }
+
+    #[test]
+    fn compat_error_codes_are_stable() {
+        assert_eq!(
+            InstallError::CompatResolve(String::new()).code(),
+            "E_COMPAT_RESOLVE"
+        );
+        assert_eq!(
+            InstallError::CompatDownload(String::new()).code(),
+            "E_COMPAT_DOWNLOAD"
+        );
+        assert_eq!(
+            InstallError::CompatStalled(String::new()).code(),
+            "E_COMPAT_STALLED"
+        );
+        assert_eq!(
+            InstallError::CompatInvalid(String::new()).code(),
+            "E_COMPAT_INVALID"
+        );
+        assert_eq!(
+            InstallError::CompatApply(String::new()).code(),
+            "E_COMPAT_APPLY"
+        );
+        assert_eq!(
+            InstallError::CompatUnavailable(String::new()).code(),
+            "E_COMPAT_UNAVAILABLE"
         );
     }
 }

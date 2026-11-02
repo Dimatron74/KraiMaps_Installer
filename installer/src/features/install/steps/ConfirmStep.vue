@@ -34,7 +34,7 @@ function formatSize(bytes: number): string {
   <div v-if="pack">
     <h2 class="text-lg font-bold text-primary">Подтвердите установку</h2>
     <p class="mt-1 text-sm text-secondary">
-      Без вашего согласия установщик ничего не меняет в игре.
+      Без вашего согласия установщик ничего не меняет в лаунчерах.
     </p>
 
     <div class="glass-card mt-4 p-4">
@@ -59,10 +59,14 @@ function formatSize(bytes: number): string {
         <span
           :class="[
             'shrink-0 rounded-full px-2.5 py-1 text-xs font-bold',
-            pack.is_modded ? 'bg-warning-500/15 text-warning-400' : 'bg-success-500/15 text-success-400',
+            pack.is_modded
+              ? 'bg-warning-500/15 text-warning-400'
+              : store.requiresOptifine
+                ? 'bg-primary-500/15 text-primary-400'
+                : 'bg-success-500/15 text-success-400',
           ]"
         >
-          {{ pack.is_modded ? 'С модами' : 'Ванилла' }}
+          {{ pack.is_modded ? 'С модами' : store.requiresOptifine ? 'OptiFine' : 'Ванилла' }}
         </span>
       </div>
 
@@ -83,6 +87,14 @@ function formatSize(bytes: number): string {
 
       <Alert v-if="store.siteLoaderConflict" tone="warning" class="mt-3">
         <p class="text-xs">{{ store.siteLoaderConflict }}</p>
+      </Alert>
+
+      <Alert
+        v-if="store.compatConfirmHint"
+        :tone="pack.is_modded ? 'warning' : 'info'"
+        class="mt-3"
+      >
+        <p class="text-xs">{{ store.compatConfirmHint }}</p>
       </Alert>
     </div>
 

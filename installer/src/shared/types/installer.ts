@@ -55,6 +55,49 @@ export interface ResourcePackSelection {
   kind: ResourcePackKind;
 }
 
+/**
+ * Слой совместимости для карты, требующей OptiFine. OptiFine — патч, а не
+ * загрузчик, поэтому отдельный тип (см. `domain::CompatKind`).
+ */
+export type CompatKind = 'fo' | 'optifine';
+
+/** Лёгкая сводка слоя: без списка файлов и без токенов. */
+export interface CompatSummary {
+  kind: CompatKind;
+  display_name: string;
+  /** FO — номер версии сборки; OptiFine — имя jar с optifine.net. */
+  version: string;
+  loader: LoaderKind;
+  loader_version: string;
+  mc_version: string;
+  /** `null` — размер неизвестен до скачивания (OptiFine). */
+  total_bytes: number | null;
+  apply_bytes: number | null;
+  files_count: number;
+  /** Путь к плану в приватном temp: фронт носит только его. */
+  plan_path: string;
+  /** Причина fallback-ветки (FO недоступен — ставим Forge + OptiFine). */
+  note?: string | null;
+}
+
+/** Non-fatal сбой слоя: карта уже установлена, пользователь видит причину. */
+export interface CompatFailure {
+  code: string;
+  message: string;
+  details: string;
+}
+
+export interface CompatReport {
+  /** `null` — план не удалось прочитать; сводка у фронта всё равно есть. */
+  kind: CompatKind | null;
+  display_name: string;
+  version: string;
+  files_written: number;
+  /** SHA-256 jar OptiFine — для «Подробнее». */
+  jar_sha256?: string | null;
+  error: CompatFailure | null;
+}
+
 export interface GameTarget {
   launcher: LauncherKind;
   name: string;
@@ -98,6 +141,8 @@ export interface DeployPlan {
   wipe_mods: boolean;
   /** Включённые пользователем ресурспаки (с галочек экрана проверки). */
   resource_packs: ResourcePackSelection[];
+  /** План слоя совместимости — только для свежей цели (`targetIsFresh`). */
+  compat_plan_path?: string | null;
 }
 
 export interface DeployReport {
@@ -107,6 +152,8 @@ export interface DeployReport {
   skipped_identical: string[];
   /** Финальные имена ресурспаков в resourcepacks/. */
   resource_packs_written: string[];
+  /** Слой совместимости: успех или non-fatal причина (`null` — не ставили). */
+  compat?: CompatReport | null;
 }
 
 /** Итог подготовки версии TLauncher (ensure_tlauncher_version). */
@@ -114,6 +161,8 @@ export interface EnsureResult {
   target: GameTarget;
   /** Общие mods/ пусты — wipe не потребуется. */
   mods_empty: boolean;
+  /** Цель создана установщиком (а не найдена готовая): слой совместимости — только в такую. */
+  created: boolean;
   /** Предвыбор версии в конфиге TL выполнен. */
   preselected: boolean;
 }

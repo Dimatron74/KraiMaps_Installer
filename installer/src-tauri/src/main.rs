@@ -26,6 +26,7 @@ fn main() {
         }));
     }
     builder
+        .manage(services::compat_temp::CompatTemp::default())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
@@ -57,6 +58,9 @@ fn main() {
             commands::icon_data_url,
             commands::resource_pack_icon,
             commands::deploy_pack,
+            commands::prepare_compat,
+            commands::apply_compat,
+            commands::discard_compat,
             commands::close_launcher,
             commands::reopen_launcher,
             commands::suggest_world_name,
@@ -82,6 +86,12 @@ fn main() {
             std::thread::spawn(crate::services::temp_clean::sweep_stale_temp);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Map Installer");
+        .build(tauri::generate_context!())
+        .expect("error while building Map Installer")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                use tauri::Manager;
+                app.state::<services::compat_temp::CompatTemp>().release();
+            }
+        });
 }

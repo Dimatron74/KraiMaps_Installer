@@ -798,7 +798,7 @@ fn kill_child_tree(child: &mut tokio::process::Child) {
     {
         // Процесс мог завершиться сам — тогда и дерева нет, taskkill не нужен.
         if let Some(pid) = child.id() {
-            let _ = std::process::Command::new("taskkill")
+            let _ = crate::services::process::background_command("taskkill")
                 .args(["/PID", &pid.to_string(), "/T", "/F"])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -962,7 +962,7 @@ async fn run_command_with_limits(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default(),
     ));
-    let mut child = tokio::process::Command::new(exe)
+    let mut child = tokio::process::Command::from(crate::services::process::background_command(exe))
         .args(args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1179,6 +1179,9 @@ pub struct EnsureResult {
     pub target: GameTarget,
     /// `mods/` цели пусты — wipe не потребуется.
     pub mods_empty: bool,
+    /// Цель создана установщиком в этом вызове (а не найдена готовая).
+    /// Слой совместимости допустим только в такую цель.
+    pub created: bool,
     /// Предвыбор версии в конфиге лаунчера выполнен.
     pub preselected: bool,
 }
@@ -1879,6 +1882,53 @@ mod tests {
         })
         .await;
         assert!(r.is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn installer_process_does_not_attach_a_windows_console() {
+        let _guard = CANCEL_TEST_LOCK.lock().await;
+        const PROBE_CHILD: &str = "KRAIMAPS_CONSOLE_PROBE_CHILD";
+        const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+        if std::env::var_os(PROBE_CHILD).is_none() {
+            // CI может не иметь консоли: отдельный родитель делает проверку флага детерминированной.
+            let output = tokio::process::Command::new(std::env::current_exe().expect("test executable"))
+                .creation_flags(CREATE_NEW_CONSOLE)
+                .env(PROBE_CHILD, "1")
+                .args(["--exact", "adapters::vanilla::tests::installer_process_does_not_attach_a_windows_console",
+                    "--nocapture"])
+                .output().await.expect("console parent");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "console probe failed: {stdout}\n{stderr}");
+            assert!(stdout.lines().any(|line| line == "console=0"), "probe did not run: {stdout}");
+            return;
+        }
+        let script = r#"
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class InstallerConsoleProbe {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+}
+'@
+[Console]::Out.WriteLine("console=" + [InstallerConsoleProbe]::GetConsoleWindow().ToInt64());
+[Console]::Out.WriteLine("probe-stdout");
+[Console]::Error.WriteLine("probe-stderr");
+"#;
+        let log = run_command_with_limits(
+            Path::new("powershell.exe"),
+            &["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), script.into()],
+            &|_| {},
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ).await.expect("console probe");
+
+        assert!(log.lines().any(|line| line == "console=0"), "service process has a console: {log}");
+        assert!(log.contains("probe-stdout"), "stdout must remain available: {log}");
+        assert!(log.contains("probe-stderr"), "stderr must remain available: {log}");
+        println!("{log}");
     }
 
     #[cfg(windows)]

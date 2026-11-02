@@ -149,7 +149,15 @@ pub async fn ensure_version(
     // Версия уже есть (помеченная или обычная — матчим по паре).
     if let Some(found) = vanilla::find_match(data_dir, mc_version, loader, &loader_version) {
         let _closed = close_tlauncher();
-        return finish(data_dir, roaming, mc_version, loader, loader_version, found.dir_name);
+        return finish(
+            data_dir,
+            roaming,
+            mc_version,
+            loader,
+            loader_version,
+            found.dir_name,
+            false,
+        );
     }
 
     let _closed = close_tlauncher();
@@ -168,7 +176,15 @@ pub async fn ensure_version(
         progress,
     )
     .await?;
-    finish(data_dir, roaming, mc_version, loader, loader_version, marked)
+    finish(
+        data_dir,
+        roaming,
+        mc_version,
+        loader,
+        loader_version,
+        marked,
+        true,
+    )
 }
 
 /// Финал ensure: цель + предвыбор версии (только при закрытом TL) +
@@ -180,6 +196,7 @@ fn finish(
     loader: crate::domain::LoaderKind,
     loader_version: String,
     dir_name: String,
+    created: bool,
 ) -> Result<vanilla::EnsureResult, InstallError> {
     let mut preselected = false;
     if let Some(roaming) = roaming {
@@ -203,6 +220,7 @@ fn finish(
             loader_version: Some(loader_version),
         },
         mods_empty: vanilla::mods_empty(data_dir),
+        created,
         preselected,
     })
 }

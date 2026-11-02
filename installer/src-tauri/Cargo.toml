@@ -3,7 +3,7 @@ name = "MapInstaller"
 version = "0.2.0"
 description = "KraiMaps Installer"
 authors = ["KraiMaps"]
-edition = "2026"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -52,12 +52,18 @@ base64 = "0.23.1"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 semver = "1"
+percent-encoding = "2"
+scraper = { version = "0.29", default-features = false }
+cap-std = "4.0.3"
+cap-fs-ext = "4.0.3"
+tempfile = "3.27.0"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

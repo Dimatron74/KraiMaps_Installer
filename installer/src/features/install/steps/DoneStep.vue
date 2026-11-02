@@ -1,14 +1,30 @@
 <script setup lang="ts">
-import { onMounted } from 'vue';
+import { computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useInstallStore } from '../../../app/stores/install';
 import { useSiteInstallStore } from '../../../app/stores/siteInstall';
 import Alert from '../../../shared/ui/Alert.vue';
 import Btn from '../../../shared/ui/Btn.vue';
+import CompatDetails from '../components/CompatDetails.vue';
 
 const store = useInstallStore();
 const site = useSiteInstallStore();
 const router = useRouter();
+
+/** Отчёт слоя: `null` — слой не пытались ставить (существующая цель). */
+const compat = computed(() => store.report?.compat ?? null);
+const compatFailed = computed(() => !!compat.value?.error);
+
+/** Сеть/stall у OptiFine в России часто лечится VPN — говорим прямо. */
+const compatVpnHint = computed(() => {
+  const err = compat.value?.error;
+  if (!err || compat.value?.kind !== 'optifine') return null;
+  return ['E_COMPAT_STALLED', 'E_COMPAT_DOWNLOAD', 'E_COMPAT_RESOLVE', 'E_COMPAT_UNAVAILABLE'].includes(
+    err.code,
+  )
+    ? 'Если optifine.net не отвечает, в России может понадобиться VPN.'
+    : null;
+});
 
 onMounted(() => {
   if (site.idempotencyKey) {
@@ -38,6 +54,49 @@ function goHome() {
         и {{ store.report.resource_packs_written.length }} ресурспаками</template>.
     </p>
 
+    <Alert v-if="compat && !compatFailed" tone="success" class="mt-4 max-w-md text-left">
+      <p class="text-xs">
+        Сборка совместимости установлена: {{ compat.display_name }}.
+      </p>
+      <CompatDetails :summary="store.compat" :report="compat" />
+    </Alert>
+
+    <Alert v-else-if="store.compatUnavailable" tone="warning" class="mt-4 max-w-md text-left">
+      <p class="text-xs">{{ store.compatUnavailable }}</p>
+      <p v-if="store.compatPreparationFailure" class="mt-1 text-xs">
+        Карта установлена без OptiFine. Проверьте подключение; новую попытку со сборкой можно
+        начать с главной.
+      </p>
+      <CompatDetails :summary="store.compat" :failure="store.compatPreparationFailure" />
+    </Alert>
+
+    <Alert
+      v-else-if="store.compatSkipReason && !compatFailed"
+      :tone="store.targetIsFresh ? 'warning' : 'info'"
+      class="mt-4 max-w-md text-left"
+    >
+      <p class="text-xs">{{ store.compatSkipReason }}</p>
+      <CompatDetails :summary="store.compat" />
+    </Alert>
+
+    <Alert v-else-if="compatFailed" tone="warning" class="mt-4 max-w-md text-left">
+      <p class="text-xs">
+        Карта установлена, но сборка совместимости не встала: {{ compat?.error?.message }}.
+      </p>
+      <p class="mt-1 text-xs">Закройте игру, проверьте подключение и нажмите «Повторить».</p>
+      <p v-if="compatVpnHint" class="mt-1 text-xs">{{ compatVpnHint }}</p>
+      <CompatDetails :summary="store.compat" :report="compat" />
+      <Btn
+        v-if="store.compatInDeploy"
+        variant="secondary"
+        class="mt-3"
+        :loading="store.busy"
+        @click="store.retryCompat()"
+      >
+        Повторить
+      </Btn>
+    </Alert>
+
     <Alert v-if="store.report && store.report.backed_up.length > 0" tone="info" class="mt-4 max-w-md text-left">
       <p class="text-xs">
         Заменённые файлы сохранены в
@@ -49,7 +108,7 @@ function goHome() {
       <p class="text-xs">{{ store.versionNote }}</p>
     </Alert>
 
-<div class="mt-6 flex w-full max-w-md flex-col gap-2">
+    <div class="mt-6 flex w-full max-w-md flex-col gap-2">
       <template v-if="store.launcher?.app_found">
         <Btn variant="success" size="lg" :loading="store.busy" @click="store.play()">
           Играть
@@ -61,7 +120,7 @@ function goHome() {
           не получится.
         </p>
       </Alert>
-      <Btn variant="secondary" @click="goHome()">На главную</Btn>
+      <Btn variant="secondary" :disabled="store.busy" @click="goHome()">На главную</Btn>
     </div>
   </div>
 </template>
