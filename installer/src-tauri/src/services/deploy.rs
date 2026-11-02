@@ -522,6 +522,123 @@ pub fn deploy_world(
     Ok(final_name)
 }
 
+/// Деплой уже собранного `.mrpack` staging: индексные файлы и overrides
+/// объединены заранее, поэтому мир и контент копируются из финального слоя.
+pub fn deploy_staged_mrpack(
+    staging: &Path,
+    world_prefix: &str,
+    world_name: &str,
+    game_root: &Path,
+    wipe_mods: bool,
+    progress: Progress,
+) -> Result<DeployReport, InstallError> {
+    use crate::services::safe_fs::SafeDir;
+    let source = SafeDir::open(staging)
+        .map_err(|error| InstallError::CompatApply(format!("staging: {error}")))?;
+    let files = source.files()
+        .map_err(|error| InstallError::CompatApply(format!("staging: {error}")))?;
+    let saves_dir = game_root.join("saves");
+    std::fs::create_dir_all(&saves_dir)?;
+    let final_name = resolve_unique_name(world_name, &|name| saves_dir.join(name).exists());
+    let world_staging = saves_dir.join(format!("{final_name}.__install"));
+    if world_staging.exists() {
+        std::fs::remove_dir_all(&world_staging)?;
+    }
+    std::fs::create_dir_all(&world_staging)?;
+
+    let world_work: Vec<_> = files
+        .iter()
+        .filter_map(|entry| {
+            let path = entry.path.to_string_lossy().replace('\\', "/");
+            path.strip_prefix(world_prefix).map(|rel| (entry, rel.to_string()))
+        })
+        .collect();
+    let world_total = world_work.iter().fold(0u64, |sum, (entry, _)| sum.saturating_add(entry.size));
+    let mut world_done = 0u64;
+    for (_entry, rel) in world_work {
+        let source_path = Path::new(world_prefix).join(&rel);
+        let mut input = source.open_file(&source_path)
+            .map_err(|error| InstallError::CompatApply(format!("{rel}: {error}")))?;
+        let dest = world_staging.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        copy_counted(&mut input, &dest, progress, "world", &rel, &mut world_done, world_total)?;
+    }
+    if !world_staging.join("level.dat").is_file() {
+        std::fs::remove_dir_all(&world_staging).ok();
+        return Err(InstallError::ZipCorrupt("мир сборки распаковался без level.dat".into()));
+    }
+    std::fs::rename(&world_staging, saves_dir.join(&final_name))?;
+
+    let backup_dir = backup_dir_for(game_root);
+    let mods_dir = game_root.join("mods");
+    let mut backed_up_mods = Vec::new();
+    if wipe_mods && mods_dir.is_dir() {
+        let mut entries: Vec<_> = std::fs::read_dir(&mods_dir)?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .collect();
+        entries.sort();
+        for existing in entries {
+            let name = existing.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let dest = backup_dir.join("mods").join(&name);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&existing, &dest)?;
+            backed_up_mods.push(format!("mods/{name}"));
+        }
+    }
+
+    let content_work: Vec<_> = files
+        .iter()
+        .filter_map(|entry| {
+            let rel = entry.path.to_string_lossy().replace('\\', "/");
+            (!rel.starts_with(world_prefix)).then_some((entry, rel))
+        })
+        .collect();
+    let content_total = content_work.iter().fold(0u64, |sum, (entry, _)| sum.saturating_add(entry.size));
+    let mut content_done = 0u64;
+    let mut report = DeployReport {
+        world_dir_name: final_name.clone(),
+        backed_up: backed_up_mods,
+        ..Default::default()
+    };
+    for (_entry, rel) in content_work {
+        let dest_rel = if rel.starts_with("datapacks/") {
+            format!("saves/{final_name}/{rel}")
+        } else {
+            rel.clone()
+        };
+        let dest = game_root.join(&dest_rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if dest.is_file() {
+            let backup = backup_dir.join(&dest_rel);
+            if let Some(parent) = backup.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if !backup.exists() {
+                std::fs::copy(&dest, &backup)?;
+                report.backed_up.push(dest_rel.clone());
+            }
+        }
+        let mut input = source.open_file(Path::new(&rel))
+            .map_err(|error| InstallError::CompatApply(format!("{rel}: {error}")))?;
+        copy_counted(&mut input, &dest, progress, "layers", &rel, &mut content_done, content_total)?;
+        if let Some(mod_rel) = rel.strip_prefix("mods/") {
+            report.mods_written.push(mod_rel.to_string());
+        }
+    }
+    report.mods_written.sort();
+    report.mods_written.dedup();
+    Ok(report)
+}
+
 /// Деплой всего дерева `mods/` из архива (плоский архив: `content_prefix=""`).
 /// Ставится ВСЁ: jar в корне, вложенные файлы и подпапки рекурсивно
 /// (`mods/.index/*.toml`, `mods/pm/images/*.png` — данные сложных карт,
@@ -1139,6 +1256,43 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
             "staging вычищен"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn staged_mrpack_deploys_world_mods_and_client_overrides() {
+        let root = temp_root("staged-mrpack");
+        let staging = root.join("staging");
+        std::fs::create_dir_all(staging.join("saves/World/region")).expect("world");
+        std::fs::create_dir_all(staging.join("mods")).expect("mods");
+        std::fs::create_dir_all(staging.join("config")).expect("config");
+        std::fs::write(staging.join("saves/World/level.dat"), b"level").expect("level");
+        std::fs::write(staging.join("saves/World/region/r.mca"), b"region").expect("region");
+        std::fs::write(staging.join("mods/new.jar"), b"new-mod").expect("mod");
+        std::fs::write(staging.join("config/map.cfg"), b"config").expect("config");
+        std::fs::write(staging.join("options.txt"), b"pack-options").expect("options");
+        let game = root.join("game");
+        std::fs::create_dir_all(game.join("mods")).expect("game mods");
+        std::fs::write(game.join("mods/old.jar"), b"old-mod").expect("old mod");
+        std::fs::write(game.join("options.txt"), b"user-options").expect("user options");
+
+        let report = deploy_staged_mrpack(
+            &staging,
+            "saves/World/",
+            "World",
+            &game,
+            true,
+            &noop_progress,
+        ).expect("deploy staged mrpack");
+
+        assert_eq!(report.world_dir_name, "World");
+        assert_eq!(report.mods_written, ["new.jar"]);
+        assert!(game.join("saves/World/level.dat").is_file());
+        assert!(game.join("saves/World/region/r.mca").is_file());
+        assert_eq!(std::fs::read(game.join("mods/new.jar")).expect("new mod"), b"new-mod");
+        assert!(!game.join("mods/old.jar").exists());
+        assert_eq!(read_backup_file(&game, "mods/old.jar"), b"old-mod");
+        assert_eq!(std::fs::read(game.join("options.txt")).expect("options"), b"pack-options");
+        assert_eq!(read_backup_file(&game, "options.txt"), b"user-options");
     }
 
     #[test]

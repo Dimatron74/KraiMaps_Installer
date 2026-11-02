@@ -1,13 +1,13 @@
 //! Собственный движок `.mrpack` по официальной спецификации Modrinth.
 //!
-//! Зачем свой: TLauncher, Legacy и официальный лаунчер не умеют импортировать
-//! `.mrpack`, а Fabulously Optimized нужен на всех поддерживаемых лаунчерах.
+//! Зачем свой: часть поддерживаемых лаунчеров не умеет импортировать
+//! `.mrpack`, а формат нужен и для карт, и для Fabulously Optimized.
 //! Спецификация: Modrinth Help Center, «Modrinth Modpack Format».
 //!
 //! Индекс — недоверенные данные: путь санитайзится, URL проходит allowlist,
 //! SHA-512 обязателен, `server-overrides/` игнорируется, jar не исполняется.
 
-use crate::domain::{CompatFile, InstallError};
+use crate::domain::{CompatFile, InstallError, LoaderKind};
 use crate::services::http::{self, Expected};
 use crate::services::compat_temp::CompatTempFile;
 use crate::services::safe_fs::SafeDir;
@@ -30,6 +30,10 @@ pub const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub struct ModrinthIndex {
     pub format_version: u32,
     pub game: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
     pub files: Vec<IndexFile>,
     pub dependencies: IndexDependencies,
 }
@@ -66,6 +70,12 @@ pub struct IndexDependencies {
     pub minecraft: Option<String>,
     #[serde(default, rename = "fabric-loader")]
     pub fabric_loader: Option<String>,
+    #[serde(default)]
+    pub forge: Option<String>,
+    #[serde(default, rename = "quilt-loader")]
+    pub quilt_loader: Option<String>,
+    #[serde(default)]
+    pub neoforge: Option<String>,
 }
 
 /// Проверенный вариант Fabulously Optimized под точную версию Minecraft.
@@ -81,6 +91,11 @@ pub struct FoVersion {
 /// Разобранный и проверенный индекс: готовые файлы для плана.
 #[derive(Debug, Clone)]
 pub struct ParsedPack {
+    pub name: Option<String>,
+    pub version_id: Option<String>,
+    pub mc_version: String,
+    pub loader: LoaderKind,
+    /// Пустая строка только у ванильного пака без loader-dependency.
     pub loader_version: String,
     pub files: Vec<CompatFile>,
     pub total_bytes: u64,
@@ -150,15 +165,36 @@ pub fn path_key(path: &str) -> String {
     }
 }
 
-/// Разбор индекса: проверяет игру, версию MC, наличие `fabric-loader`,
-/// пути, URL, SHA-512 и лимиты. Любое расхождение — `E_COMPAT_INVALID`:
-/// ставить «полусобранный» пак нельзя.
+/// Разбор индекса для слоя совместимости: требуется точная MC и Fabric.
 #[cfg(test)]
 pub fn parse_index(raw: &[u8], mc: &str) -> Result<ParsedPack, InstallError> {
     parse_index_with_budget(raw, mc, &WorkBudget::default())
 }
 
 pub fn parse_index_with_budget(raw: &[u8], mc: &str, budget: &WorkBudget) -> Result<ParsedPack, InstallError> {
+    let parsed = parse_index_document(raw, Some(mc), budget)?;
+    if parsed.loader != LoaderKind::Fabric {
+        return Err(InstallError::CompatInvalid("в индексе нет fabric-loader".into()));
+    }
+    if parsed.files.is_empty() {
+        return Err(InstallError::CompatInvalid(
+            "в индексе нет файлов для клиента".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Разбор входного `.mrpack`: загрузчик определяется по официальным ключам
+/// dependencies, ожидаемая MC проверяется только если её передал вызывающий.
+pub fn parse_index_for_install_with_budget(
+    raw: &[u8],
+    expected_mc: Option<&str>,
+    budget: &WorkBudget,
+) -> Result<ParsedPack, InstallError> {
+    parse_index_document(raw, expected_mc, budget)
+}
+
+fn parse_index_document(raw: &[u8], expected_mc: Option<&str>, budget: &WorkBudget) -> Result<ParsedPack, InstallError> {
     budget.check().map_err(|error| InstallError::CompatApply(error.to_string()))?;
     let index: ModrinthIndex = serde_json::from_slice(raw)
         .map_err(|e| InstallError::CompatInvalid(format!("modrinth.index.json: {e}")))?;
@@ -177,23 +213,38 @@ pub fn parse_index_with_budget(raw: &[u8], mc: &str, budget: &WorkBudget) -> Res
     let index_mc = index
         .dependencies
         .minecraft
-        .as_deref()
-        .ok_or_else(|| InstallError::CompatInvalid("в индексе нет версии Minecraft".into()))?;
-    if index_mc != mc {
-        return Err(InstallError::CompatInvalid(format!(
-            "сборка для Minecraft {index_mc}, а карта для {mc}"
-        )));
-    }
-    let loader_version = index
-        .dependencies
-        .fabric_loader
         .clone()
-        .ok_or_else(|| InstallError::CompatInvalid("в индексе нет fabric-loader".into()))?;
-    if !is_exact_loader_version(&loader_version) {
+        .ok_or_else(|| InstallError::CompatInvalid("в индексе нет версии Minecraft".into()))?;
+    if expected_mc.is_some_and(|mc| mc != index_mc) {
         return Err(InstallError::CompatInvalid(format!(
-            "некорректная версия fabric-loader: {loader_version}"
+            "сборка для Minecraft {index_mc}, а карта для {}",
+            expected_mc.unwrap_or_default()
         )));
     }
+    let dependencies = &index.dependencies;
+    let candidates = [
+        (LoaderKind::Fabric, dependencies.fabric_loader.as_deref(), "fabric-loader"),
+        (LoaderKind::Forge, dependencies.forge.as_deref(), "forge"),
+        (LoaderKind::Quilt, dependencies.quilt_loader.as_deref(), "quilt-loader"),
+        (LoaderKind::NeoForge, dependencies.neoforge.as_deref(), "neoforge"),
+    ];
+    let present: Vec<_> = candidates.into_iter().filter(|(_, version, _)| version.is_some()).collect();
+    if present.len() > 1 {
+        return Err(InstallError::CompatInvalid(
+            "в индексе указано несколько загрузчиков".into(),
+        ));
+    }
+    let (loader, loader_version) = match present.first() {
+        Some((loader, Some(version), key)) => {
+            if !is_exact_loader_version(version) {
+                return Err(InstallError::CompatInvalid(format!(
+                    "некорректная версия {key}: {version}"
+                )));
+            }
+            (*loader, (*version).to_string())
+        }
+        _ => (LoaderKind::Vanilla, String::new()),
+    };
 
     let mut files = Vec::new();
     let mut paths = HashSet::new();
@@ -253,12 +304,11 @@ pub fn parse_index_with_budget(raw: &[u8], mc: &str, budget: &WorkBudget) -> Res
             sha1,
         });
     }
-    if files.is_empty() {
-        return Err(InstallError::CompatInvalid(
-            "в индексе нет файлов для клиента".into(),
-        ));
-    }
     Ok(ParsedPack {
+        name: index.name,
+        version_id: index.version_id,
+        mc_version: index_mc,
+        loader,
         loader_version,
         files,
         total_bytes,
@@ -430,10 +480,10 @@ pub fn apply_size_with_budget(files: &[CompatFile], mrpack: &[u8], budget: &Work
     Ok(sizes.values().sum())
 }
 
-struct OverrideEntry {
-    index: usize,
-    path: String,
-    size: u64,
+pub struct OverrideEntry {
+    pub index: usize,
+    pub path: String,
+    pub size: u64,
 }
 
 fn override_entries(mrpack: &[u8], indexed_bytes: u64, budget: &WorkBudget) -> Result<Vec<OverrideEntry>, InstallError> {
@@ -489,7 +539,27 @@ fn override_entries(mrpack: &[u8], indexed_bytes: u64, budget: &WorkBudget) -> R
     Ok(entries)
 }
 
-/// Распаковка `overrides/`, затем `client-overrides/` в staging.
+pub fn override_entries_for_install(
+    mrpack: &[u8],
+    budget: &WorkBudget,
+) -> Result<Vec<OverrideEntry>, InstallError> {
+    override_entries(mrpack, 0, budget)
+}
+
+/// Финальные client-файлы: при совпадении пути `client-overrides/`
+/// заменяет запись из `overrides/`, включая её zip-индекс и размер.
+pub fn final_override_entries_with_budget(
+    mrpack: &[u8],
+    budget: &WorkBudget,
+) -> Result<Vec<OverrideEntry>, InstallError> {
+    let mut final_entries: HashMap<String, OverrideEntry> = HashMap::new();
+    for entry in override_entries(mrpack, 0, budget)? {
+        final_entries.insert(path_key(&entry.path), entry);
+    }
+    let mut entries: Vec<_> = final_entries.into_values().collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
+}
 /// `server-overrides/` не нужны клиентской установке. Второй проход
 /// перекрывает первый — так спецификация задаёт приоритет client-overrides.
 #[cfg(test)]

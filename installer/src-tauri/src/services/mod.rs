@@ -7,6 +7,7 @@ pub mod download;
 pub mod http;
 pub mod icon;
 pub mod java;
+pub mod mrpack;
 pub mod normalize;
 pub mod process;
 pub mod provenance;

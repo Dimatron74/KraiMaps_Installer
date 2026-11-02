@@ -16,6 +16,8 @@ export interface PackAnalysis {
   file_name: string;
   file_size_bytes: number;
   sha256: string;
+  is_mrpack: boolean;
+  mrpack?: MrpackInfo | null;
   world_name: string;
   world_version: string | null;
   is_modded: boolean;
@@ -32,6 +34,15 @@ export interface PackAnalysis {
   overrides_alias: boolean;
   /** Loose-ресурспаки рядом с миром (вне мира и вне resourcepacks/). */
   resource_packs: ResourcePackInfo[];
+}
+
+export interface MrpackInfo {
+  name: string | null;
+  version_id: string | null;
+  mc_version: string;
+  loader_version: string | null;
+  files_count: number;
+  total_bytes: number;
 }
 
 /** Вид ресурспака в архиве: распакованная папка или zip-файл. */

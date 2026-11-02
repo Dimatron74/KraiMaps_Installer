@@ -4,10 +4,12 @@
 //! `.mrpack`-файла. Анализ только читает центральный каталог архива
 //! (без распаковки на диск), находит `level.dat`, классифицирует слои.
 
+use crate::adapters::modrinth_pack;
 use crate::domain::{
-    GameTarget, InstallError, LauncherKind, LoaderKind, ModInfo, PackAnalysis, ResourcePackInfo,
-    ResourcePackKind,
+    GameTarget, InstallError, LauncherKind, LoaderKind, ModInfo, MrpackInfo, PackAnalysis,
+    ResourcePackInfo, ResourcePackKind,
 };
+use crate::services::work_budget::WorkBudget;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -228,6 +230,17 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
         )));
     }
 
+    if names.iter().any(|name| name == "modrinth.index.json") {
+        return analyze_mrpack(
+            path,
+            &mut archive,
+            &names,
+            file_name,
+            file_size_bytes,
+            sha256,
+        );
+    }
+
     if world_roots.is_empty() {
         return Err(InstallError::NoLevelDat);
     }
@@ -367,6 +380,8 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
         file_name,
         file_size_bytes,
         sha256,
+        is_mrpack: false,
+        mrpack: None,
         world_name,
         world_version,
         is_modded,
@@ -380,6 +395,127 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
         content_prefix,
         overrides_alias,
         resource_packs,
+    })
+}
+
+fn analyze_mrpack(
+    path: &Path,
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    names: &[String],
+    file_name: String,
+    file_size_bytes: u64,
+    sha256: String,
+) -> Result<PackAnalysis, InstallError> {
+    let budget = WorkBudget::default();
+    let bytes = std::fs::read(path)?;
+    let parsed = modrinth_pack::parse_index_for_install_with_budget(
+        &modrinth_pack::read_index_with_budget(&bytes, &budget)?,
+        None,
+        &budget,
+    )?;
+    let overrides = modrinth_pack::final_override_entries_with_budget(&bytes, &budget)?;
+
+    let mut logical_files: Vec<(String, u64, Option<usize>)> = parsed
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), file.size, None))
+        .collect();
+    logical_files.extend(
+        overrides
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.size, Some(entry.index))),
+    );
+    let worlds: Vec<_> = logical_files
+        .iter()
+        .filter(|(path, _, _)| path.ends_with("/level.dat") || path == "level.dat")
+        .collect();
+    if worlds.is_empty() {
+        return Err(InstallError::NoLevelDat);
+    }
+    if worlds.len() > 1 {
+        let mut roots: Vec<String> = worlds
+            .iter()
+            .map(|(path, _, _)| parent_prefix(path))
+            .collect();
+        roots.sort();
+        return Err(InstallError::MultipleWorlds(roots));
+    }
+    let (world_file, _, world_entry) = worlds[0];
+    let logical_world_prefix = parent_prefix(world_file);
+    let world_name = world_name_of(&logical_world_prefix);
+    let world_version = match world_entry {
+        Some(index) => read_world_version(archive, *index)?,
+        None => None,
+    };
+
+    let mut layers = BTreeSet::new();
+    let mut mods = Vec::new();
+    for (path, size, _) in &logical_files {
+        if *path == logical_world_prefix || path.starts_with(&logical_world_prefix) {
+            continue;
+        }
+        if is_root_game_file(path) {
+            layers.insert("root".to_string());
+        } else {
+            layers.insert(top_segment(path));
+        }
+        if path.starts_with("mods/") && path.ends_with(".jar") {
+            let file_name = path.rsplit('/').next().unwrap_or(path).to_string();
+            mods.push(ModInfo {
+                mod_id: file_name
+                    .strip_suffix(".jar")
+                    .unwrap_or(&file_name)
+                    .to_string(),
+                file_name,
+                version: None,
+                loader: parsed.loader,
+                size_bytes: *size,
+            });
+        }
+    }
+    mods.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+    let is_modded = parsed.loader != LoaderKind::Vanilla || !mods.is_empty();
+    let total_bytes = parsed.total_bytes.saturating_add(
+        overrides
+            .iter()
+            .fold(0u64, |sum, entry| sum.saturating_add(entry.size)),
+    );
+    let physical_world_prefix = world_entry
+        .and_then(|index| names.get(index))
+        .map(|name| parent_prefix(name))
+        .unwrap_or_else(|| logical_world_prefix.clone());
+    let content_prefix = if names.iter().any(|name| name.starts_with("overrides/")) {
+        "overrides/".to_string()
+    } else {
+        String::new()
+    };
+
+    Ok(PackAnalysis {
+        file_name,
+        file_size_bytes,
+        sha256,
+        is_mrpack: true,
+        mrpack: Some(MrpackInfo {
+            name: parsed.name,
+            version_id: parsed.version_id,
+            mc_version: parsed.mc_version,
+            loader_version: (!parsed.loader_version.is_empty()).then(|| parsed.loader_version.clone()),
+            files_count: parsed.files.len(),
+            total_bytes,
+        }),
+        world_name,
+        world_version,
+        is_modded,
+        loader: parsed.loader,
+        loader_version_hint: (!parsed.loader_version.is_empty()).then_some(parsed.loader_version),
+        mods,
+        layers: layers.into_iter().collect(),
+        total_uncompressed_bytes: total_bytes,
+        entry_count: parsed.files.len() + overrides.len(),
+        world_prefix: physical_world_prefix,
+        content_prefix,
+        overrides_alias: false,
+        resource_packs: Vec::new(),
     })
 }
 
@@ -1200,6 +1336,67 @@ versionRange="[1.18.2]"
         assert_eq!(pack.world_name, "MyWorld");
         assert_eq!(pack.world_prefix, "saves/MyWorld/");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrpack_uses_indexed_mods_and_world_from_overrides() {
+        let path = temp_zip_path("mrpack-analysis");
+        let level = level_dat_bytes("1.20.6");
+        let index = format!(
+            r#"{{"formatVersion":1,"game":"minecraft","name":"Map Pack","versionId":"1.0.0",
+                "files":[{{"path":"mods/sodium.jar","hashes":{{"sha512":"{}"}},
+                "downloads":["https://cdn.modrinth.com/data/a/versions/1/sodium.jar"],"fileSize":123}}],
+                "dependencies":{{"minecraft":"1.20.6","fabric-loader":"0.19.3"}}}}"#,
+            "a".repeat(128)
+        );
+        write_zip(
+            &path,
+            &[
+                ("modrinth.index.json", index.as_bytes()),
+                ("overrides/saves/MapWorld/level.dat", &level),
+                ("overrides/options.txt", b"gfx"),
+            ],
+        );
+
+        let pack = analyze_zip(&path).expect("analyze mrpack");
+        assert!(pack.is_modded);
+        assert_eq!(pack.loader, LoaderKind::Fabric);
+        assert_eq!(pack.loader_version_hint.as_deref(), Some("0.19.3"));
+        assert_eq!(pack.world_name, "MapWorld");
+        assert_eq!(pack.world_version.as_deref(), Some("1.20.6"));
+        assert_eq!(pack.mods.len(), 1);
+        assert_eq!(pack.mods[0].file_name, "sodium.jar");
+        assert!(pack.resource_packs.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn mrpack_supports_every_loader_dependency() {
+        for (key, expected) in [
+            ("fabric-loader", LoaderKind::Fabric),
+            ("forge", LoaderKind::Forge),
+            ("quilt-loader", LoaderKind::Quilt),
+            ("neoforge", LoaderKind::NeoForge),
+        ] {
+            let path = temp_zip_path("mrpack-loader");
+            let level = level_dat_bytes("1.20.1");
+            let index = format!(
+                r#"{{"formatVersion":1,"game":"minecraft","files":[],
+                    "dependencies":{{"minecraft":"1.20.1","{key}":"1.2.3"}}}}"#
+            );
+            write_zip(
+                &path,
+                &[
+                    ("modrinth.index.json", index.as_bytes()),
+                    ("overrides/saves/World/level.dat", &level),
+                ],
+            );
+
+            let pack = analyze_zip(&path).expect("analyze loader");
+            assert_eq!(pack.loader, expected, "{key}");
+            assert_eq!(pack.loader_version_hint.as_deref(), Some("1.2.3"));
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     #[test]

@@ -10,7 +10,7 @@ use crate::domain::{
     PackAnalysis,
 };
 use crate::services::{
-    auth, compat, deploy, detect, download, normalize, provenance, site, update_policy, versions,
+    auth, compat, deploy, detect, download, mrpack, normalize, provenance, site, update_policy, versions,
 };
 use crate::services::compat_temp::{CompatLease, CompatTemp};
 use serde::Serialize;
@@ -184,7 +184,8 @@ pub async fn deploy_pack(
     // у Modrinth/TLauncher/Legacy/официального — сам game dir. Единая точка
     // правды — `normalize::game_root`.
     let game_root = Arc::new(normalize::game_root(&target));
-    let temp_root = if plan.compat_plan_path.is_some() {
+    let is_mrpack = mrpack::is_mrpack(&plan.zip_path);
+    let temp_root = if is_mrpack || plan.compat_plan_path.is_some() {
         compat_temp_root(&app).map(Some)
     } else {
         Ok(None)
@@ -195,8 +196,12 @@ pub async fn deploy_pack(
         .and(compat.as_ref().and_then(|c| c.total_bytes));
     let compat_apply_bytes = plan.compat_plan_path.as_ref()
         .and(compat.as_ref().and_then(|summary| summary.apply_bytes));
-    let totals = deploy::stage_totals(&plan, compat_bytes, compat_apply_bytes).map_err(CmdError::from)?;
-    let overall = Arc::new(Mutex::new(OverallState::new(&totals, &plan)));
+    let totals = if is_mrpack {
+        mrpack::stage_totals(&plan.zip_path).map_err(CmdError::from)?
+    } else {
+        deploy::stage_totals(&plan, compat_bytes, compat_apply_bytes).map_err(CmdError::from)?
+    };
+    let overall = Arc::new(Mutex::new(OverallState::new(&totals, &plan, is_mrpack)));
     let progress: ProgressFn = {
         let overall = overall.clone();
         Arc::new(move |mut ev: deploy::StageEvent| {
@@ -219,6 +224,7 @@ pub async fn deploy_pack(
         Arc::new(plan),
         compat,
         temp_root,
+        is_mrpack,
         progress,
         overall,
         totals,
@@ -236,6 +242,7 @@ struct OverallState {
     stage_done: u64,
     total: u64,
     compat_phase: Option<CompatPhase>,
+    staged_pack: bool,
     last_emit: Instant,
 }
 
@@ -245,7 +252,7 @@ enum CompatPhase {
 }
 
 impl OverallState {
-    fn new(totals: &deploy::StageTotals, plan: &deploy::DeployPlan) -> Self {
+    fn new(totals: &deploy::StageTotals, plan: &deploy::DeployPlan, staged_pack: bool) -> Self {
         Self {
             base: 0,
             stage: "world",
@@ -253,6 +260,7 @@ impl OverallState {
             stage_done: 0,
             total: totals.overall(plan.deploy_mods, !plan.resource_packs.is_empty()),
             compat_phase: None,
+            staged_pack,
             last_emit: Instant::now() - Duration::from_secs(1),
         }
     }
@@ -271,6 +279,12 @@ impl OverallState {
                 self.stage_done = 0;
                 self.compat_phase = Some(CompatPhase::Apply);
             }
+        }
+        if self.staged_pack && self.stage == "world" && ev.stage == "layers" {
+            self.base = self.base.saturating_add(self.stage_total);
+            self.stage = "layers";
+            self.stage_total = ev.total_bytes;
+            self.stage_done = 0;
         }
         // Отменённый blocking-worker может закончить callback после перехода.
         if ev.stage != self.stage {
@@ -338,10 +352,14 @@ async fn deploy_into(
     plan: Arc<deploy::DeployPlan>,
     compat: Option<CompatSummary>,
     temp_root: Result<Option<CompatLease>, InstallError>,
+    is_mrpack: bool,
     progress: ProgressFn,
     overall: Arc<Mutex<OverallState>>,
     totals: deploy::StageTotals,
 ) -> Result<deploy::DeployReport, InstallError> {
+    if is_mrpack {
+        return deploy_mrpack_into(game_root, target, plan, temp_root, progress, overall, totals).await;
+    }
     // Мир — первым: overrides слоя могут дописывать в `saves/<мир>/`
     // (datapacks), поэтому папка мира должна существовать до слоя.
     let world_dir_name = {
@@ -507,6 +525,47 @@ async fn deploy_into(
     let report = joined(tauri::async_runtime::spawn_blocking(content).await)?;
     progress(deploy::StageEvent::new("layers", totals.layers, totals.layers, String::new()));
     Ok(report)
+}
+
+async fn deploy_mrpack_into(
+    game_root: Arc<PathBuf>,
+    target: Arc<GameTarget>,
+    plan: Arc<deploy::DeployPlan>,
+    temp_root: Result<Option<CompatLease>, InstallError>,
+    progress: ProgressFn,
+    overall: Arc<Mutex<OverallState>>,
+    totals: deploy::StageTotals,
+) -> Result<deploy::DeployReport, InstallError> {
+    let temp = temp_root?
+        .ok_or_else(|| InstallError::CompatApply("нет temp для сборки карты".into()))?;
+    let staging = temp.staging()
+        .map_err(|error| InstallError::CompatApply(format!("staging: {error}")))?;
+    overall.lock().expect("overall progress state").begin_compat(&totals);
+    let budget = crate::services::work_budget::WorkBudget::within(Duration::from_secs(20 * 60));
+    let _cancel = budget.cancel_on_drop();
+    let layout = mrpack::stage_mrpack(
+        &plan.zip_path,
+        Some(&target.minecraft_version),
+        target.loader,
+        target.loader_version.as_deref(),
+        &staging,
+        progress.clone(),
+        &budget,
+    ).await?;
+    overall.lock().expect("overall progress state").finish_compat();
+    enter_stage(&overall, "world", totals.world, 0);
+
+    let wipe = plan.wipe_mods && !is_fresh_target(&target);
+    joined(tauri::async_runtime::spawn_blocking(move || {
+        deploy::deploy_staged_mrpack(
+            &staging,
+            &layout.world_prefix,
+            &plan.world_name,
+            &game_root,
+            wipe,
+            &*progress,
+        )
+    }).await)
 }
 
 /// Подготовка слоя совместимости (OptiFine). `E_COMPAT_UNAVAILABLE` — не
@@ -1221,7 +1280,7 @@ mod tests {
         temp: CompatLease,
     ) -> (deploy::DeployReport, Vec<deploy::StageEvent>) {
         let totals = deploy::stage_totals(&plan, summary.total_bytes, summary.apply_bytes).expect("stage totals");
-        let overall = Arc::new(Mutex::new(OverallState::new(&totals, &plan)));
+        let overall = Arc::new(Mutex::new(OverallState::new(&totals, &plan, false)));
         let events = Arc::new(Mutex::new(Vec::new()));
         let progress: ProgressFn = {
             let (overall, events) = (overall.clone(), events.clone());
@@ -1231,7 +1290,7 @@ mod tests {
             })
         };
         let report = deploy_into(Arc::new(normalize::game_root(&target)), Arc::new(target),
-            Arc::new(plan), Some(summary), Ok(Some(temp)), progress, overall, totals)
+            Arc::new(plan), Some(summary), Ok(Some(temp)), false, progress, overall, totals)
             .await.expect("map deployment");
         let events = events.lock().expect("events").clone();
         (report, events)
@@ -1440,7 +1499,7 @@ mod tests {
     #[test]
     fn unknown_optifine_bytes_do_not_change_the_known_overall_range() {
         let totals = deploy::StageTotals { world: 5, layers: 3, ..Default::default() };
-        let mut state = OverallState::new(&totals, &map_plan(Path::new("unused.zip")));
+        let mut state = OverallState::new(&totals, &map_plan(Path::new("unused.zip")), false);
         let overall = Mutex::new(state);
         enter_stage(&overall, "compat-download", 0, 5);
         state = overall.into_inner().expect("overall");
@@ -1461,7 +1520,7 @@ mod tests {
             ("compat-download", 40, 100, 48),
             ("compat-apply", 20, 60, 128),
         ] {
-            let state = OverallState::new(&totals, &map_plan(Path::new("unused.zip")));
+            let state = OverallState::new(&totals, &map_plan(Path::new("unused.zip")), false);
             let overall = Mutex::new(state);
             enter_stage(&overall, "compat-download", 100, 5);
             let mut state = overall.into_inner().expect("overall");

@@ -70,6 +70,8 @@ function hasOptifineMarker(meta: SiteMeta | null): boolean {
  * основная версия манифеста. Неизвестная версия — `null`, гадать запрещено.
  */
 function targetMcVersionFor(pack: PackAnalysis | null, meta: SiteMeta | null): string | null {
+  const indexed = pack?.mrpack?.mc_version?.trim();
+  if (indexed) return indexed;
   const world = pack?.world_version?.trim();
   if (world) return world;
   const primary = meta?.minecraftPrimary?.trim();
@@ -168,7 +170,9 @@ function effectiveLoaderVersion(state: {
 }): string | null {
   const pack = state.pack;
   if (!pack?.is_modded) return null;
-  const hint = siteLoaderVersionHint(state.siteMeta);
+  const hint = pack.is_mrpack
+    ? (pack.mrpack?.loader_version ?? pack.loader_version_hint)
+    : siteLoaderVersionHint(state.siteMeta);
   return state.loaderVersion ?? hint ?? pack.loader_version_hint ?? null;
 }
 
@@ -343,7 +347,7 @@ export const useInstallStore = defineStore('install', {
      * сам по себе он ни на что, кроме слоя совместимости, не влияет.
      */
     requiresOptifine(state): boolean {
-      return !!state.pack && hasOptifineMarker(state.siteMeta);
+      return !!state.pack && !state.pack.is_mrpack && hasOptifineMarker(state.siteMeta);
     },
 
     /** Версия MC, под которую ставится слой (мир → манифест → неизвестна). */
@@ -356,7 +360,7 @@ export const useInstallStore = defineStore('install', {
      * (свои моды важнее), требование не заявлено или версия MC неизвестна.
      */
     compatBranch(state): CompatKind | null {
-      if (!state.pack || state.pack.is_modded || !hasOptifineMarker(state.siteMeta)) {
+      if (!state.pack || state.pack.is_mrpack || state.pack.is_modded || !hasOptifineMarker(state.siteMeta)) {
         return null;
       }
       return compatBranchFor(targetMcVersionFor(state.pack, state.siteMeta));
@@ -804,7 +808,7 @@ export const useInstallStore = defineStore('install', {
       }
       const pack = this.pack;
       if (!pack) return;
-      if (!hasOptifineMarker(this.siteMeta)) {
+      if (!hasOptifineMarker(this.siteMeta) || pack.is_mrpack) {
         this.compatPrepared = true;
         return;
       }
@@ -871,11 +875,9 @@ export const useInstallStore = defineStore('install', {
       // же самое. Сбрасываем в любом исходе — после провала клик должен суметь
       // повторить.
       loaderVersionRequest ??= (async () => {
-        // Приоритет по спеке (D7): точная версия автора из манифеста проходит
-        // как есть (без сети); диапазон/отсутствие — хинт архива → meta-API.
-        // Хинт из архива может быть диапазоном ("[40,)") — бэкенд такой не
-        // примет и отрезолвит в последнюю версию.
-        const siteVersion = siteLoaderVersionHint(this.siteMeta);
+        // Для `.mrpack` индекс автора задаёт точную версию; для обычного zip
+        // приоритет у точной версии сайта, затем хинт архива → meta-API.
+        const siteVersion = pack.is_mrpack ? null : siteLoaderVersionHint(this.siteMeta);
         const baseHint = siteVersion ?? pack.loader_version_hint;
         this.loaderVersion = await api.resolveLoaderVersion(pack.loader, mc, baseHint);
         this.loaderVersionAuto = this.loaderVersion !== baseHint;
@@ -977,10 +979,9 @@ export const useInstallStore = defineStore('install', {
         if (compat) {
           loaderVersion = compat.loader_version;
         } else if (pack.is_modded) {
-          // Приоритет версии по спеке (D7): точная версия автора из манифеста
-          // проходит через резолв как есть (без сети); диапазон/отсутствие —
-          // хинт архива → meta-API. Тип загрузчика всегда из архива.
-          const siteVersion = siteLoaderVersionHint(this.siteMeta);
+          // Индекс `.mrpack` важнее метаданных сайта; для обычного zip точная
+          // версия сайта идёт первой, затем хинт архива → meta-API.
+          const siteVersion = pack.is_mrpack ? null : siteLoaderVersionHint(this.siteMeta);
           // Хинт из архива может быть диапазоном ("[40,)") — его нельзя
           // писать в инстанс. Бэкенд пропустит точную версию как есть,
           // а диапазон/отсутствие — отрезолвит через meta-API в последнюю.

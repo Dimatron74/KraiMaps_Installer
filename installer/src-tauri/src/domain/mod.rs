@@ -431,12 +431,17 @@ pub struct LauncherInfo {
 }
 
 /// Результат анализа zip: нормализованная модель пака (§14 ТЗ).
-/// Деплой стримится из исходного архива напрямую, без промежуточного `.mrpack`.
+/// Обычный zip деплоится напрямую; `.mrpack` сначала собирается в приватный staging.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackAnalysis {
     pub file_name: String,
     pub file_size_bytes: u64,
     pub sha256: String,
+    /// Входной `.mrpack` с `modrinth.index.json` в корне.
+    #[serde(default)]
+    pub is_mrpack: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrpack: Option<MrpackInfo>,
     /// Имя мира = имя родителя `level.dat`.
     pub world_name: String,
     /// Версия мира из `level.dat → Version.Name` (может отсутствовать).
@@ -464,6 +469,17 @@ pub struct PackAnalysis {
     /// выбор пользователя (галочки) фронт присылает в плане деплоя.
     #[serde(default)]
     pub resource_packs: Vec<ResourcePackInfo>,
+}
+
+/// Сводка входного Modrinth-пака для выбора версии и экрана подтверждения.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MrpackInfo {
+    pub name: Option<String>,
+    pub version_id: Option<String>,
+    pub mc_version: String,
+    pub loader_version: Option<String>,
+    pub files_count: usize,
+    pub total_bytes: u64,
 }
 
 /// Один мод из `mods/*.jar` в корне архива.

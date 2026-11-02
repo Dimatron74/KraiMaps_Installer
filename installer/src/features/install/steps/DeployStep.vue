@@ -10,9 +10,10 @@ import CompatDetails from '../components/CompatDetails.vue';
 
 const store = useInstallStore();
 
-/** Порядок стадий деплоя: мир → слой совместимости → контент карты.
- * Провижининг загрузчика (`installer-*`) идёт до деплоя и в счётчик не входит. */
+/** Порядок стадий: обычный zip — мир → совместимость → контент;
+ * `.mrpack` — скачивание/сборка staging → мир → контент. */
 const activeStages = computed(() => {
+  if (store.pack?.is_mrpack) return ['compat-download', 'compat-apply', 'world', 'layers'];
   const list = ['world'];
   if (store.compatInDeploy) list.push('compat-download', 'compat-apply');
   if (store.pack?.is_modded) list.push('mods');
@@ -55,8 +56,10 @@ const stageName = computed(() => {
     case 'resourcepacks':
       return 'Ставим ресурспаки…';
     case 'compat-download':
+      if (store.pack?.is_mrpack) return 'Скачиваем файлы сборки…';
       return store.compat?.kind === 'optifine' ? 'Скачиваем OptiFine…' : 'Скачиваем сборку…';
     case 'compat-apply':
+      if (store.pack?.is_mrpack) return 'Готовим файлы сборки…';
       return store.compat?.kind === 'optifine' ? 'Ставим OptiFine…' : 'Ставим сборку…';
     case 'installer-download':
       return loader ? `Качаем установщик ${loader}…` : 'Качаем установщик загрузчика…';

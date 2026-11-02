@@ -11,6 +11,7 @@ const pack = computed(() => store.pack!);
 
 /** Точная версия автора из манифеста — приоритет над хинтом архива (D7). */
 const siteVersion = computed(() => {
+  if (pack.value.is_mrpack) return null;
   const v = store.siteMeta?.loaderVersion?.trim();
   return v && isExactVersion(v) ? v : null;
 });
@@ -72,8 +73,8 @@ function formatSize(bytes: number): string {
 
       <dl class="mt-3 space-y-1.5 text-xs">
         <div class="flex justify-between gap-4">
-          <dt class="text-tertiary">Версия мира</dt>
-          <dd class="font-semibold text-primary">{{ pack.world_version ?? 'неизвестна' }}</dd>
+          <dt class="text-tertiary">{{ pack.is_mrpack ? 'Версия Minecraft' : 'Версия мира' }}</dt>
+          <dd class="font-semibold text-primary">{{ pack.mrpack?.mc_version ?? pack.world_version ?? 'неизвестна' }}</dd>
         </div>
         <div v-if="pack.is_modded" class="flex justify-between gap-4">
           <dt class="text-tertiary">Загрузчик</dt>
