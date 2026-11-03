@@ -6,13 +6,15 @@
 # Два job'а (только Windows/NSIS — единственный bundle-target):
 #   build (windows): версии → `tauri build` с подписью → S3 immutable-файлы
 #     версии (`installer/<version>/`, кэш год) → tar-артефакт для publish.
-#   publish (ubuntu): указатель latest (кэш год!) → purge CDN → зеркало
-#     GitHub Release (только теги).
+#   publish (ubuntu): указатель latest (кэш год!) → purge CDN (указатели +
+#     папка версии) → зеркало GitHub Release (только теги).
 #
 # Кэширование как у архивов карт на сайте: всё immutable — год
 # (`public, max-age=31536000, immutable`, та же строка, что
-# `CACHE_CONTROL_IMMUTABLE` сайта). Указатель `installer/latest.json`
-# тоже годовой — свежесть держит ОБЯЗАТЕЛЬНЫЙ purge перед перезаписью.
+# `CACHE_CONTROL_IMMUTABLE` сайта). Настраивать кэш отдельным файлам нельзя —
+# он задаётся на весь CDN-ресурс, поэтому и указатель `installer/latest.json`,
+# и папка релиза `installer/<version>/` живут с годовым кэшем. Свежесть
+# держит ОБЯЗАТЕЛЬНЫЙ purge после заливки, а не TTL.
 # Порядок в publish осознанный: сначала заливка указателя, потом purge
 # (CDN сбросит кэш и подтянет новое с origin при первом запросе).
 # Purge распространяется до 15 минут (платформа) — это норма, не ошибка.
@@ -311,24 +313,26 @@ jobs:
           aws --endpoint-url "$EP" s3 cp release-manifests/latest.json "s3://$B/installer/latest.json" --acl public-read --content-type application/json --cache-control "$CC"
           aws --endpoint-url "$EP" s3 cp release-manifests/updater.json "s3://$B/installer/updater.json" --acl public-read --content-type application/json --cache-control "$CC"
 
-      - name: Purge CDN pointer cache
-        # Официальный экшен Yandex (yc-actions/yc-cdn-cache): селективный
-        # purge двух указателей. Пустой cdn-paths значил бы ПОЛНЫЙ purge
-        # всего ресурса files.kraimaps.ru (включая кэш карт!) — поэтому
-        # пути указаны явно всегда. Доступ по resource-id глобальный,
-        # folder-id для purge не нужен (нужен только при поиске по имени).
+      - name: Purge CDN cache (pointers + release files)
+        # Официальный экшен Yandex (yc-actions/yc-cdn-cache v2): селективный
+        # purge. Пустой cdn-paths значил бы ПОЛНЫЙ purge всего ресурса
+        # files.kraimaps.ru (включая кэш карт!) — поэтому пути указаны явно
+        # всегда. Доступ по resource-id глобальный, folder-id для purge не
+        # нужен (нужен только при поиске по имени).
+        # Пути:
+        #   latest.json / updater.json — изменяемые указатели (кэш год);
+        #   installer/<version>/*     — файлы релиза (exe, sig, манифесты),
+        #     чтобы после публикации не остался старый кэш папки версии.
+        # Звёздочка допустима только в конце пути (правило Yandex CDN).
         # Распространение — до 15 минут (платформа), это норма.
-        # Падение шага = ГРОМКО: состояние «S3 новое + CDN старое на год»
-        # чинится только ручным purge:
-        #   yc cdn cache purge --resource-id <id> \
-        #     --path /installer/latest.json*,/installer/updater.json*
-        uses: yc-actions/yc-cdn-cache@a220813dd1c9488313f6ae6776f48e145a016cd8 # v1
+        uses: yc-actions/yc-cdn-cache@66e713e99c1071970c877bc2474c1945e9a1862a # v2
         with:
           yc-sa-json-credentials: ${{ secrets.INSTALLER_YC_SA_KEY }}
           cdn-resource-id: ${{ vars.INSTALLER_CDN_RESOURCE_ID }}
           cdn-paths: |
             /installer/latest.json*
             /installer/updater.json*
+            /installer/${{ needs.build.outputs.version }}/*
 
       # --- Публичное зеркало + доказуемое происхождение (только теги) ---
       # Ручной dispatch релиз не создаёт: ему не к чему его привязывать
