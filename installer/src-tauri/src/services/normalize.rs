@@ -81,10 +81,12 @@ pub(crate) fn is_root_game_file(rel: &str) -> bool {
 
 /// Декодирует сырое имя записи zip: строгий UTF-8 → CP866 (старые русские
 /// архивы без UTF-8 флага, напр. мир «Охотник…» в DH.zip) → lossy.
+/// Разделители приводятся к `/`: часть архивов (Windows-архиваторы) пишет
+/// пути с `\`, и без нормализации префиксы миров и слоёв не совпадут.
 /// Никогда не паникует; ZipSlip-проверка идёт отдельно по `enclosed_name`.
 pub(crate) fn decode_name(raw: &[u8]) -> String {
     if let Ok(s) = std::str::from_utf8(raw) {
-        return s.to_string();
+        return s.replace('\\', "/");
     }
     let mut out = String::with_capacity(raw.len());
     for &b in raw {
@@ -92,7 +94,21 @@ pub(crate) fn decode_name(raw: &[u8]) -> String {
     }
     // Если и CP866 дал мусор (вопросительные бокс-символы повально) —
     // это всё равно лучше паники: запись классифицируется и ставится.
-    out
+    out.replace('\\', "/")
+}
+
+/// Безопасный ли логический путь записи: относительный, без выхода вверх.
+/// `enclosed_name()` крейта не ловит `..\evil` на Unix (там `\` — часть
+/// имени файла), а после нормализации разделителей такой путь опасен.
+pub(crate) fn is_safe_relative_path(path: &str) -> bool {
+    if path.starts_with('/') {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    path.split('/').all(|part| part != "..")
 }
 
 /// Один байт CP866 в char. ASCII — как есть, 0x80–0xFF — по таблице,
@@ -199,16 +215,16 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
     // Имена декодируем сами (UTF-8 → CP866): name()/by_name() крейта
     // расходятся на не-UTF8 архивах. Доступ дальше — только по индексам.
     let mut total_uncompressed: u64 = 0;
-    let mut world_roots: BTreeSet<String> = BTreeSet::new();
+    let mut world_roots: BTreeMap<String, usize> = BTreeMap::new();
     let mut names: Vec<String> = Vec::with_capacity(archive.len());
-    let mut level_dat_index: Option<usize> = None;
     for i in 0..archive.len() {
         let entry = archive
             .by_index(i)
             .map_err(|e| InstallError::ZipCorrupt(e.to_string()))?;
         let raw = decode_name(entry.name_raw());
-        // ZipSlip: доверяем только путям, которые санитизирует сам zip-крейт.
-        if entry.enclosed_name().is_none() {
+        // ZipSlip: доверяем только путям, которые санитизирует сам zip-крейт,
+        // и нормализованным путям без выхода за пределы архива.
+        if entry.enclosed_name().is_none() || !is_safe_relative_path(&raw) {
             return Err(InstallError::ZipSlip(raw));
         }
         total_uncompressed = total_uncompressed.saturating_add(entry.size());
@@ -219,8 +235,7 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
         }
         if raw.ends_with("level.dat") && !entry.is_dir() {
             let parent = parent_prefix(&raw);
-            world_roots.insert(parent);
-            level_dat_index = Some(i);
+            world_roots.insert(parent, i);
         }
         names.push(raw);
     }
@@ -244,12 +259,24 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
     if world_roots.is_empty() {
         return Err(InstallError::NoLevelDat);
     }
-    if world_roots.len() > 1 {
-        let mut roots: Vec<String> = world_roots.into_iter().collect();
-        roots.sort();
-        return Err(InstallError::MultipleWorlds(roots));
+    // Мир внутри мира (`Map/world/level.dat` при `Map/level.dat`) — это часть
+    // внешнего мира, а не вторая карта: оставляем только внешние корни.
+    let mut roots: Vec<String> = world_roots.keys().cloned().collect();
+    roots.sort();
+    let outermost: Vec<String> = roots
+        .iter()
+        .filter(|candidate| {
+            !roots
+                .iter()
+                .any(|other| other != *candidate && candidate.starts_with(other.as_str()))
+        })
+        .cloned()
+        .collect();
+    if outermost.len() > 1 {
+        return Err(InstallError::MultipleWorlds(outermost));
     }
-    let world_prefix = world_roots.into_iter().next().expect("checked non-empty");
+    let world_prefix = outermost.into_iter().next().expect("checked non-empty");
+    let level_dat_index = world_roots[&world_prefix];
     let world_name = world_name_of(&world_prefix);
 
     // Правило deploy-all без исключений: в инстанс едет ВСЁ из архива.
@@ -305,10 +332,7 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
     }
 
     // Версия мира из level.dat (доступ по индексу — см. выше).
-    let world_version = read_world_version(
-        &mut archive,
-        level_dat_index.expect("single world checked above"),
-    )?;
+    let world_version = read_world_version(&mut archive, level_dat_index)?;
 
     // Loose-ресурспаки рядом с миром (папки и zip вне мира и вне
     // `resourcepacks/`): маркер `pack.mcmeta`, как `level.dat` у миров.
@@ -1454,6 +1478,88 @@ versionRange="[1.18.2]"
             .expect("towerofdoom mod");
         assert_eq!(tod.version.as_deref(), Some("1.0.0"));
         // Кастомные верхние записи тоже ставятся (deploy-all без исключений).
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn nested_world_inside_world_is_one_map() {
+        let path = temp_zip_path("nested-world");
+        let outer = level_dat_bytes("1.19.4");
+        let inner = level_dat_bytes("1.20.1");
+        write_zip(
+            &path,
+            &[
+                ("OreMine2.0/level.dat", &outer),
+                ("OreMine2.0/world/level.dat", &inner),
+            ],
+        );
+
+        let pack = analyze_zip(&path).expect("analyze nested world");
+        assert_eq!(pack.world_prefix, "OreMine2.0/");
+        assert_eq!(pack.world_name, "OreMine2.0");
+        assert_eq!(pack.world_version.as_deref(), Some("1.19.4"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn backslash_entry_names_are_normalized_and_mods_detected() {
+        let path = temp_zip_path("backslash");
+        let level = level_dat_bytes("1.20.1");
+        let jar = forge_jar_bytes();
+        write_zip(
+            &path,
+            &[
+                (
+                    "Hollow Hunt BETA\\Minecraft 1.20.1\\saves\\Hollow Hunt BETA\\level.dat",
+                    &level,
+                ),
+                (
+                    "Hollow Hunt BETA\\Minecraft 1.20.1\\mods\\hollowhunt.jar",
+                    &jar,
+                ),
+            ],
+        );
+
+        let pack = analyze_zip(&path).expect("analyze backslash names");
+        assert_eq!(
+            pack.world_prefix,
+            "Hollow Hunt BETA/Minecraft 1.20.1/saves/Hollow Hunt BETA/"
+        );
+        assert_eq!(pack.content_prefix, "Hollow Hunt BETA/Minecraft 1.20.1/");
+        assert!(pack.is_modded);
+        assert_eq!(pack.loader, LoaderKind::Forge);
+        assert_eq!(pack.mods.len(), 1);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn worlds_of_different_versions_are_reported_as_multiple() {
+        let path = temp_zip_path("sibling-worlds");
+        let level = level_dat_bytes("1.19.2");
+        write_zip(
+            &path,
+            &[
+                ("Hollow Hunt BETA/Minecraft 1.19.2/saves/World/level.dat", &level),
+                ("Hollow Hunt BETA/Minecraft 1.20.1/saves/World/level.dat", &level),
+            ],
+        );
+
+        let error = analyze_zip(&path).expect_err("two sibling worlds");
+        let InstallError::MultipleWorlds(roots) = &error else {
+            panic!("expected MultipleWorlds, got {error:?}");
+        };
+        assert_eq!(roots.len(), 2, "{roots:?}");
+        assert!(error.to_string().contains("верси"), "{error}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn backslash_traversal_entry_is_rejected() {
+        let path = temp_zip_path("backslash-traversal");
+        write_zip(&path, &[("..\\evil.txt", b"escape")]);
+
+        let error = analyze_zip(&path).expect_err("traversal");
+        assert!(matches!(error, InstallError::ZipSlip(_)), "{error:?}");
         std::fs::remove_file(&path).ok();
     }
 

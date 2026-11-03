@@ -1134,6 +1134,26 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
         );
     }
 
+    #[test]
+    fn world_with_backslash_entry_names_unpacks_into_nested_folders() {
+        let root = temp_root("backslash-world");
+        let zip = root.join("map.zip");
+        write_zip(
+            &zip,
+            &[
+                ("World\\level.dat", b"level"),
+                ("World\\region\\r.0.0.mca", b"region"),
+            ],
+        );
+        let saves = root.join("saves");
+
+        let name = deploy_world(&zip, "World/", "World", &saves, &noop_progress).expect("deploy");
+
+        assert_eq!(name, "World");
+        assert!(saves.join("World/level.dat").is_file());
+        assert!(saves.join("World/region/r.0.0.mca").is_file());
+    }
+
     /// Регрессия «полоса в начале при 78%»: прогресс стадий идёт в несжатых
     /// байтах (а не в номерах записей), монотонно 0 → total. Тысяча мелких
     /// datapack-файлов больше не перевешивает один большой region-файл.
