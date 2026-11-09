@@ -53,5 +53,6 @@ async function pick() {
       и поставит мир, моды и настройки одной кнопкой.
     </p>
     <Btn class="mt-6" size="lg" @click="pick">Выбрать zip-архив</Btn>
+    <p class="mt-3 text-xs text-tertiary">…или перетащите zip-архив в окно</p>
   </div>
 </template>

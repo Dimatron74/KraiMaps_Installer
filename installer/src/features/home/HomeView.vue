@@ -81,7 +81,7 @@ async function openSocial(url: string) {
         </h2>
         <p class="mt-3 max-w-md text-sm leading-relaxed text-secondary">
           Установщик сам установит карту в твой лаунчер.<br />
-          С компьютера - файлом, с сайта - в один клик со страницы карты.
+          С компьютера — перетащите архив в окно, с сайта — в один клик со страницы карты.
         </p>
         <div class="mt-7 flex flex-wrap items-center gap-3">
           <Btn size="lg" @click="goInstall">Выбрать файл с компьютера</Btn>

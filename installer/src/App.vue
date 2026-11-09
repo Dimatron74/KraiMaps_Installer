@@ -2,20 +2,26 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from './app/stores/auth';
+import { useNotificationsStore } from './app/stores/notifications';
 import { useSiteInstallStore } from './app/stores/siteInstall';
 import { useUpdaterStore } from './app/stores/updater';
+import { useArchiveDrop } from './features/install/useArchiveDrop';
 import UpdateBlocked from './features/updater/UpdateBlocked.vue';
 import UpdateOffer from './features/updater/UpdateOffer.vue';
 import { parseProtocolUrl } from './shared/utils/protocol';
 import { resolveMediaUrl } from './shared/utils/media';
 import Alert from './shared/ui/Alert.vue';
 import BrandMark from './shared/ui/BrandMark.vue';
+import DropOverlay from './shared/ui/DropOverlay.vue';
 import ErrorDetails from './shared/ui/ErrorDetails.vue';
+import GlobalNotifications from './shared/ui/GlobalNotifications.vue';
 import Skeleton from './shared/ui/Skeleton.vue';
 
 const auth = useAuthStore();
 const site = useSiteInstallStore();
 const updater = useUpdaterStore();
+const notifications = useNotificationsStore();
+const { dragging } = useArchiveDrop();
 const router = useRouter();
 const route = useRoute();
 
@@ -238,6 +244,8 @@ async function logout() {
     </main>
     <UpdateOffer v-if="updater.offerOpen && !updater.blocked" />
     <UpdateBlocked v-if="updater.blocked" />
+    <DropOverlay :show="dragging" />
+    <GlobalNotifications :items="notifications.items" @dismiss="notifications.remove" />
   </div>
 </template>
 
