@@ -49,17 +49,6 @@ async function openSocial(url: string) {
           linear-gradient(to bottom, #0b1526 0%, #0a1220 45%, #050810 100%);
       "
     />
-    <!-- Сетка кубов -->
-    <div
-      class="absolute inset-0 opacity-[0.13]"
-      aria-hidden="true"
-      style="
-        background-image:
-          repeating-linear-gradient(to right, rgba(148, 197, 255, 0.5) 0 1px, transparent 1px 44px),
-          repeating-linear-gradient(to bottom, rgba(148, 197, 255, 0.5) 0 1px, transparent 1px 44px);
-        mask-image: radial-gradient(560px 380px at 50% 30%, black 30%, transparent 75%);
-      "
-    />
     <!-- Парящие блоки: тропа справа + тихий противовес слева -->
     <div class="absolute right-[10%] top-[12%] hidden h-16 w-16 sm:block" aria-hidden="true">
       <div class="h-full w-full rounded-lg border border-emerald-300/30 bg-emerald-400/10 shadow-[0_0_40px_rgba(74,222,128,0.25)]" />
