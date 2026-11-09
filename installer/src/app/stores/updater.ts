@@ -16,7 +16,6 @@ import { toErrorCode, toErrorDetails, toUserMessage } from '../../shared/utils/e
 import type { UpdateDownloadEvent, UpdateStatusName } from '../../shared/types/updater';
 
 const AUTO_KEY = 'mi.updates.autoCheck';
-const DISMISSED_KEY = 'mi.updates.dismissedFor';
 
 export type UpdatePhase = 'idle' | 'checking' | 'downloading' | 'ready' | 'error';
 
@@ -47,6 +46,7 @@ export const useUpdaterStore = defineStore('updater', {
     notes: null as string | null,
     /** Видимость мягкого оффера (hard показывается отдельным экраном). */
     offerOpen: false,
+    snoozedFor: null as string | null,
     /** Прогресс установки 0..100 (`null` — неизвестен размер). */
     percent: null as number | null,
     error: null as UpdateError | null,
@@ -110,11 +110,7 @@ export const useUpdaterStore = defineStore('updater', {
 
     dismissOffer(): void {
       this.offerOpen = false;
-      try {
-        if (this.latest) localStorage.setItem(DISMISSED_KEY, this.latest);
-      } catch {
-        /* best-effort */
-      }
+      this.snoozedFor = this.latest;
     },
 
     /** Скачивание и установка. Прогресс — из канала Rust. */
@@ -205,14 +201,9 @@ export const useUpdaterStore = defineStore('updater', {
       this.notes = result.notes;
       this.phase = 'idle';
       if (result.status === 'soft') {
-        let dismissed: string | null = null;
-        try {
-          dismissed = localStorage.getItem(DISMISSED_KEY);
-        } catch {
-          /* читаем как есть */
-        }
-        // Ручная проверка показывает оффер всегда; авто — если версию ещё не откладывали.
-        this.offerOpen = manual || dismissed !== result.latest;
+        // Ручная проверка показывает оффер всегда; авто — если версию ещё не
+        // откладывали в этой сессии. «Позже» действует до перезапуска.
+        this.offerOpen = manual || this.snoozedFor !== result.latest;
       } else {
         this.offerOpen = false;
         if (result.status === 'current' && manual) {
