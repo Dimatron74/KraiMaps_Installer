@@ -2,7 +2,7 @@
 //! в приватный staging и последующий деплой финального client-содержимого.
 
 use crate::adapters::modrinth_pack::{self, ParsedPack};
-use crate::domain::{InstallError, LoaderKind};
+use crate::domain::{InstallError, LoaderKind, WorldCandidate};
 use crate::services::compat_temp::CompatLease;
 use crate::services::work_budget::WorkBudget;
 use crate::services::{deploy, http};
@@ -71,7 +71,17 @@ fn inspect(path: &Path, expected_mc: Option<&str>) -> Result<Inspection, Install
     if worlds.len() > 1 {
         let mut roots: Vec<String> = worlds.iter().map(|(path, _)| parent_prefix(path)).collect();
         roots.sort();
-        return Err(InstallError::MultipleWorlds(roots));
+        // Версии миров здесь неизвестны: `inspect` читает индекс пака, а не
+        // `level.dat` миров, поэтому сообщение остаётся общим.
+        return Err(InstallError::MultipleWorlds(
+            roots
+                .into_iter()
+                .map(|path| WorldCandidate {
+                    path,
+                    version: None,
+                })
+                .collect(),
+        ));
     }
     let world_prefix = parent_prefix(&worlds[0].0);
     Ok(Inspection {

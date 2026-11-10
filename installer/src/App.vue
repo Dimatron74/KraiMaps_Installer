@@ -2,14 +2,18 @@
 import { computed, onMounted, ref, watch } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import { useAuthStore } from './app/stores/auth';
+import { useInstallStore } from './app/stores/install';
 import { useNotificationsStore } from './app/stores/notifications';
+import { useReviewPromptStore } from './app/stores/reviewPrompt';
 import { useSiteInstallStore } from './app/stores/siteInstall';
 import { useUpdaterStore } from './app/stores/updater';
 import { useArchiveDrop } from './features/install/useArchiveDrop';
+import ReviewPromptModal from './features/review/ReviewPromptModal.vue';
 import UpdateBlocked from './features/updater/UpdateBlocked.vue';
 import UpdateOffer from './features/updater/UpdateOffer.vue';
 import { parseProtocolUrl } from './shared/utils/protocol';
 import { resolveMediaUrl } from './shared/utils/media';
+import { getReviewTrigger } from './shared/utils/reviewPrompt';
 import Alert from './shared/ui/Alert.vue';
 import BrandMark from './shared/ui/BrandMark.vue';
 import DropOverlay from './shared/ui/DropOverlay.vue';
@@ -18,12 +22,37 @@ import GlobalNotifications from './shared/ui/GlobalNotifications.vue';
 import Skeleton from './shared/ui/Skeleton.vue';
 
 const auth = useAuthStore();
+const install = useInstallStore();
 const site = useSiteInstallStore();
 const updater = useUpdaterStore();
 const notifications = useNotificationsStore();
+const review = useReviewPromptStore();
 const { dragging } = useArchiveDrop();
 const router = useRouter();
 const route = useRoute();
+const reviewStartupReady = ref(false);
+
+const reviewTrigger = computed(() =>
+  getReviewTrigger({
+    startupReady: reviewStartupReady.value,
+    page: route.name,
+    installStep: install.step,
+    siteStep: site.step,
+    blocked: auth.status === 'unknown' || updater.blocked || updater.offerOpen || dragging.value,
+  }),
+);
+
+watch(
+  reviewTrigger,
+  (trigger) => {
+    if (!trigger) {
+      review.dismiss();
+      return;
+    }
+    review.maybeShow(trigger);
+  },
+  { immediate: true },
+);
 
 const avatarSrc = computed(() => resolveMediaUrl(auth.user?.avatar_url));
 const avatarFailed = ref(false);
@@ -43,10 +72,10 @@ async function handleRawUrl(raw: string) {
         auth.pendingMapId = null;
         // Сначала уходим с экрана входа на прогресс, потом качаем:
         // иначе пользователь сидит на логине без обратной связи.
-        router.push('/install');
+        await router.push('/install');
         await site.startFromSite(id, mode, 'Вход выполнен');
       } else {
-        router.push('/');
+        await router.push('/');
       }
     } catch (e) {
       // handleOAuthCallback уже решил: guest + ошибка (фатально) или
@@ -58,7 +87,7 @@ async function handleRawUrl(raw: string) {
       // AuthGate покажет их через «Подробнее».
       auth.status = 'guest';
       auth.setError(e);
-      router.push({
+      await router.push({
         name: 'enter',
         query: auth.pendingMapId !== null ? { mapId: String(auth.pendingMapId) } : {},
       });
@@ -70,11 +99,11 @@ async function handleRawUrl(raw: string) {
     if (!auth.isAuthed) {
       auth.pendingMapId = target.mapId;
       auth.pendingMode = target.mode;
-      router.push({ name: 'enter', query: { mapId: String(target.mapId) } });
+      await router.push({ name: 'enter', query: { mapId: String(target.mapId) } });
       return;
     }
     // Прогресс виден сразу: переход до долгого скачивания.
-    router.push('/install');
+    await router.push('/install');
     await site.startFromSite(target.mapId, target.mode);
   }
 }
@@ -105,6 +134,8 @@ onMounted(async () => {
     for (const u of initial ?? []) await handleRawUrl(u);
   } catch {
     // Браузерный dev (pnpm dev без Tauri): deep-link недоступен — обычные роуты.
+  } finally {
+    reviewStartupReady.value = true;
   }
 });
 
@@ -245,6 +276,14 @@ async function logout() {
     <UpdateOffer v-if="updater.offerOpen && !updater.blocked" />
     <UpdateBlocked v-if="updater.blocked" />
     <DropOverlay :show="dragging" />
+    <ReviewPromptModal
+      v-if="review.open && review.candidate && !updater.blocked"
+      :map="review.candidate"
+      :install-in-progress="review.duringInstall"
+      @shown="review.markShown()"
+      @rate="review.rate()"
+      @dismiss="review.dismiss()"
+    />
     <GlobalNotifications :items="notifications.items" @dismiss="notifications.remove" />
   </div>
 </template>

@@ -7,7 +7,7 @@
 use crate::adapters::modrinth_pack;
 use crate::domain::{
     GameTarget, InstallError, LauncherKind, LoaderKind, ModInfo, MrpackInfo, PackAnalysis,
-    ResourcePackInfo, ResourcePackKind,
+    ResourcePackInfo, ResourcePackKind, WorldCandidate,
 };
 use crate::services::work_budget::WorkBudget;
 use std::collections::{BTreeMap, BTreeSet};
@@ -273,7 +273,11 @@ pub fn analyze_zip(path: &Path) -> Result<PackAnalysis, InstallError> {
         .cloned()
         .collect();
     if outermost.len() > 1 {
-        return Err(InstallError::MultipleWorlds(outermost));
+        return Err(InstallError::MultipleWorlds(world_candidates(
+            &mut archive,
+            &outermost,
+            |root| world_roots.get(root).copied(),
+        )));
     }
     let world_prefix = outermost.into_iter().next().expect("checked non-empty");
     let level_dat_index = world_roots[&world_prefix];
@@ -457,12 +461,21 @@ fn analyze_mrpack(
         return Err(InstallError::NoLevelDat);
     }
     if worlds.len() > 1 {
-        let mut roots: Vec<String> = worlds
+        let mut candidates: Vec<WorldCandidate> = worlds
             .iter()
-            .map(|(path, _, _)| parent_prefix(path))
+            .enumerate()
+            .map(|(index, (path, _, entry))| WorldCandidate {
+                path: parent_prefix(path),
+                version: match entry {
+                    Some(zip_index) if index < MAX_VERSIONED_CANDIDATES => {
+                        world_version_best_effort(archive, *zip_index)
+                    }
+                    _ => None,
+                },
+            })
             .collect();
-        roots.sort();
-        return Err(InstallError::MultipleWorlds(roots));
+        candidates.sort_by(|a, b| a.path.cmp(&b.path));
+        return Err(InstallError::MultipleWorlds(candidates));
     }
     let (world_file, _, world_entry) = worlds[0];
     let logical_world_prefix = parent_prefix(world_file);
@@ -837,6 +850,46 @@ fn read_world_version(
         .map_err(|e| InstallError::ZipCorrupt(format!("level.dat unreadable: {e}")))?;
     drop(entry);
     Ok(extract_world_version(&raw))
+}
+
+/// Сколько миров читаем версию для сообщения пользователю: `level.dat` — это
+/// распаковка, а миров в архиве может быть до `MAX_ENTRIES`. Остальные идут
+/// без версии: сообщение всё равно объясняет, что миров несколько.
+const MAX_VERSIONED_CANDIDATES: usize = 8;
+
+/// Кандидаты-миры для ошибки «в архиве несколько миров»: путь и версия из
+/// `level.dat` (у первых `MAX_VERSIONED_CANDIDATES` миров).
+fn world_candidates(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    roots: &[String],
+    entry_of: impl Fn(&str) -> Option<usize>,
+) -> Vec<WorldCandidate> {
+    roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| {
+            let version = match entry_of(root) {
+                Some(entry) if index < MAX_VERSIONED_CANDIDATES => {
+                    world_version_best_effort(archive, entry)
+                }
+                _ => None,
+            };
+            WorldCandidate {
+                path: root.clone(),
+                version,
+            }
+        })
+        .collect()
+}
+
+/// Версия мира для сообщения пользователю. `level.dat`, который не читается,
+/// — не повод менять ошибку: главное «в архиве несколько миров», версии лишь
+/// уточняют её.
+fn world_version_best_effort(
+    archive: &mut zip::ZipArchive<std::fs::File>,
+    level_dat_index: usize,
+) -> Option<String> {
+    read_world_version(archive, level_dat_index).ok().flatten()
 }
 
 /// Извлекает `Version.Name` из сырого `level.dat` (gzipped NBT).
@@ -1535,21 +1588,49 @@ versionRange="[1.18.2]"
     #[test]
     fn worlds_of_different_versions_are_reported_as_multiple() {
         let path = temp_zip_path("sibling-worlds");
-        let level = level_dat_bytes("1.19.2");
         write_zip(
             &path,
             &[
-                ("Hollow Hunt BETA/Minecraft 1.19.2/saves/World/level.dat", &level),
-                ("Hollow Hunt BETA/Minecraft 1.20.1/saves/World/level.dat", &level),
+                (
+                    "Hollow Hunt BETA/Minecraft 1.19.2/saves/World/level.dat",
+                    &level_dat_bytes("1.19.2"),
+                ),
+                (
+                    "Hollow Hunt BETA/Minecraft 1.20.1/saves/World/level.dat",
+                    &level_dat_bytes("1.20.1"),
+                ),
             ],
         );
 
         let error = analyze_zip(&path).expect_err("two sibling worlds");
-        let InstallError::MultipleWorlds(roots) = &error else {
+        let InstallError::MultipleWorlds(candidates) = &error else {
             panic!("expected MultipleWorlds, got {error:?}");
         };
-        assert_eq!(roots.len(), 2, "{roots:?}");
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert_eq!(candidates[0].version.as_deref(), Some("1.19.2"));
+        assert_eq!(candidates[1].version.as_deref(), Some("1.20.1"));
         assert!(error.to_string().contains("верси"), "{error}");
+        assert!(error.to_string().contains("1.20.1"), "{error}");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn worlds_of_the_same_version_are_reported_as_multiple_without_versions() {
+        let path = temp_zip_path("sibling-worlds-same-version");
+        write_zip(
+            &path,
+            &[
+                ("Map A/level.dat", &level_dat_bytes("1.20.1")),
+                ("Map B/level.dat", &level_dat_bytes("1.20.1")),
+            ],
+        );
+
+        let error = analyze_zip(&path).expect_err("two sibling worlds");
+        let InstallError::MultipleWorlds(candidates) = &error else {
+            panic!("expected MultipleWorlds, got {error:?}");
+        };
+        assert_eq!(candidates.len(), 2, "{candidates:?}");
+        assert!(!error.to_string().contains("верси"), "{error}");
         std::fs::remove_file(&path).ok();
     }
 

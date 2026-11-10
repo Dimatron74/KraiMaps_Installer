@@ -137,6 +137,7 @@ export const useSiteInstallStore = defineStore('site-install', {
         // Иконку pickZip уже достал из архива сам (общий путь обоих потоков).
         install.setSiteMeta(
           {
+            mapId: manifest.map_id,
             loaderSlug: manifest.loader?.slug ?? null,
             loaderVersion: manifest.loader?.version ?? null,
             // Нужна, когда в архиве нет level.dat-версии: слой без версии

@@ -1,6 +1,7 @@
 /** Машина состояний визарда установки (Pinia). */
 import { defineStore } from 'pinia';
 import { listen } from '@tauri-apps/api/event';
+import { useReviewPromptStore } from './reviewPrompt';
 import { api } from '../../shared/api/commands';
 import { toErrorCode, toErrorDetails, toUserMessage } from '../../shared/utils/errors';
 import type {
@@ -42,6 +43,7 @@ export interface InstallError extends CmdError {
 
 /** Мета карты с сайта (install-manifest): влияет на версию загрузчика. */
 export interface SiteMeta {
+  mapId?: number;
   loaderSlug: string | null;
   loaderVersion: string | null;
   /** Основная версия MC из манифеста: нужна, когда в архиве её нет. */
@@ -1270,6 +1272,8 @@ export const useInstallStore = defineStore('install', {
       const target = this.target;
       const pack = this.pack;
       if (!target || !pack) return;
+      const installedMapId = this.fromSiteDownload ? this.siteMeta?.mapId : null;
+      const installedMapTitle = this.siteTitle ?? pack.world_name;
       this.step = 'deploying';
       this.busy = true;
       this.statusLine = 'Устанавливаем…';
@@ -1300,6 +1304,9 @@ export const useInstallStore = defineStore('install', {
           },
           compat,
         );
+        if (installedMapId != null) {
+          useReviewPromptStore().recordCompletedInstall(installedMapId, installedMapTitle);
+        }
         this.busy = false;
         this.statusLine = '';
         this.step = 'done';

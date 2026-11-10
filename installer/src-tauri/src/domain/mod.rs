@@ -5,6 +5,15 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Мир-кандидат в архиве: путь внутри архива и версия Minecraft из `level.dat`.
+#[derive(Debug, Clone)]
+pub struct WorldCandidate {
+    /// Префикс мира внутри архива (с `/` на конце).
+    pub path: String,
+    /// Версия мира из `level.dat`; `None` — файл не прочитан или без поля `Version`.
+    pub version: Option<String>,
+}
+
 /// Все ошибки, которые может показать UI. Каждая имеет стабильный код `E_*`
 /// для техдеталей («Подробнее») и логов. Секретов в сообщениях нет.
 #[derive(Debug, thiserror::Error)]
@@ -15,8 +24,10 @@ pub enum InstallError {
     ZipCorrupt(String),
     #[error("в архиве нет мира (файл level.dat не найден)")]
     NoLevelDat,
-    #[error("в архиве несколько разных миров, непонятно какой ставить")]
-    MultipleWorlds(Vec<String>),
+    /// В архиве несколько миров — ставить однозначно нечего. Версии нужны
+    /// пользователю, чтобы понять, какой мир оставить (см. `multi_worlds_message`).
+    #[error("{}", multi_worlds_message(.0))]
+    MultipleWorlds(Vec<WorldCandidate>),
     #[error("архив содержит небезопасные пути")]
     ZipSlip(String),
     #[error("архив превышает лимиты безопасности")]
@@ -160,7 +171,9 @@ impl InstallError {
         match self {
             Self::ZipOpen(e) => format!("open failed: {e}"),
             Self::ZipCorrupt(what) => format!("corrupt: {what}"),
-            Self::MultipleWorlds(roots) => format!("worlds: {}", roots.join(", ")),
+            Self::MultipleWorlds(candidates) => {
+                format!("worlds: {}", multi_worlds_details(candidates))
+            }
             Self::ZipSlip(entry) => format!("unsafe entry: {entry}"),
             Self::LimitExceeded(what) => format!("limit: {what}"),
             Self::HashMismatch { expected, actual } => {
@@ -192,6 +205,46 @@ impl InstallError {
             _ => self.code().to_string(),
         }
     }
+}
+
+/// Сообщение для «в архиве несколько миров». Версии называем только когда
+/// они действительно разные: именно это объясняет пользователю, почему в
+/// архиве два мира (карта под две версии Minecraft). Если версии не известны
+/// или совпадают — выдумывать нечего, остаётся общая формулировка.
+/// Что делать дальше, подсказывает UI (см. `hintFor` во фронтенде).
+fn multi_worlds_message(candidates: &[WorldCandidate]) -> String {
+    let versions = distinct_versions(candidates);
+    if versions.len() > 1 {
+        format!(
+            "в архиве миры разных версий Minecraft: {}",
+            versions.join(", ")
+        )
+    } else {
+        "в архиве несколько разных миров".to_string()
+    }
+}
+
+/// Технический список миров для «Подробнее»: путь и версия, если читалась.
+fn multi_worlds_details(candidates: &[WorldCandidate]) -> String {
+    candidates
+        .iter()
+        .map(|candidate| match &candidate.version {
+            Some(version) => format!("{} ({version})", candidate.path),
+            None => candidate.path.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Разные версии миров по возрастанию — для сообщения пользователю.
+fn distinct_versions(candidates: &[WorldCandidate]) -> Vec<&str> {
+    let mut versions: Vec<&str> = candidates
+        .iter()
+        .filter_map(|candidate| candidate.version.as_deref())
+        .collect();
+    versions.sort_unstable();
+    versions.dedup();
+    versions
 }
 
 /// Поддерживаемые лаунчеры. Prism-семейство (Prism, Pinecone — бывший ElyPrism,
@@ -650,10 +703,59 @@ mod tests {
     fn error_codes_use_e_prefix() {
         assert_eq!(InstallError::NoLevelDat.code(), "E_NO_LEVEL_DAT");
         assert_eq!(
-            InstallError::MultipleWorlds(vec![]).code(),
+            InstallError::MultipleWorlds(Vec::new()).code(),
             "E_MULTI_WORLD"
         );
         assert_eq!(InstallError::ZipSlip(String::new()).code(), "E_ZIPSLIP");
+    }
+
+    #[test]
+    fn multi_world_message_names_the_versions_when_they_differ() {
+        let error = InstallError::MultipleWorlds(vec![
+            WorldCandidate {
+                path: "Hollow Hunt BETA/Minecraft 1.19.2/saves/World/".to_string(),
+                version: Some("1.19.2".to_string()),
+            },
+            WorldCandidate {
+                path: "Hollow Hunt BETA/Minecraft 1.20.1/saves/World/".to_string(),
+                version: Some("1.20.1".to_string()),
+            },
+        ]);
+        let message = error.to_string();
+        assert!(message.contains("верси"), "{message}");
+        assert!(message.contains("1.19.2"), "{message}");
+        assert!(message.contains("1.20.1"), "{message}");
+    }
+
+    #[test]
+    fn multi_world_message_stays_generic_when_versions_are_unknown_or_equal() {
+        let unknown = InstallError::MultipleWorlds(vec![
+            WorldCandidate {
+                path: "a/".to_string(),
+                version: None,
+            },
+            WorldCandidate {
+                path: "b/".to_string(),
+                version: Some("1.20.1".to_string()),
+            },
+        ])
+        .to_string();
+        assert!(!unknown.contains("верси"), "{unknown}");
+        assert!(unknown.contains("миров"), "{unknown}");
+
+        let equal = InstallError::MultipleWorlds(vec![
+            WorldCandidate {
+                path: "a/".to_string(),
+                version: Some("1.20.1".to_string()),
+            },
+            WorldCandidate {
+                path: "b/".to_string(),
+                version: Some("1.20.1".to_string()),
+            },
+        ])
+        .to_string();
+        assert!(!equal.contains("верси"), "{equal}");
+        assert!(equal.contains("миров"), "{equal}");
     }
 
     #[test]
