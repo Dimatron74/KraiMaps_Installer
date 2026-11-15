@@ -32,7 +32,7 @@ export interface PackAnalysis {
   content_prefix: string;
   /** Alias overrides/ (упакованный модпак). */
   overrides_alias: boolean;
-  /** Loose-ресурспаки рядом с миром (вне мира и вне resourcepacks/). */
+  /** Ресурспаки архива: рядом с миром и уже лежащие в resourcepacks/. */
   resource_packs: ResourcePackInfo[];
 }
 
@@ -48,7 +48,7 @@ export interface MrpackInfo {
 /** Вид ресурспака в архиве: распакованная папка или zip-файл. */
 export type ResourcePackKind = 'folder' | 'zip';
 
-/** Ресурспак, найденный рядом с миром. Маркер — pack.mcmeta (+assets/). */
+/** Ресурспак, найденный в архиве. Маркер — pack.mcmeta (+assets/). */
 export interface ResourcePackInfo {
   /** Имя для показа: папка — basename, zip — имя файла с .zip. */
   name: string;
@@ -57,6 +57,8 @@ export interface ResourcePackInfo {
   kind: ResourcePackKind;
   /** pack.description из pack.mcmeta (может отсутствовать). */
   description: string | null;
+  /** Пак уже лежит в resourcepacks/ архива — автор положил его на место. */
+  in_place: boolean;
 }
 
 /** Включённый пользователем пак для плана деплоя. */
@@ -152,6 +154,8 @@ export interface DeployPlan {
   wipe_mods: boolean;
   /** Включённые пользователем ресурспаки (с галочек экрана проверки). */
   resource_packs: ResourcePackSelection[];
+  /** Ресурспаки с снятой галочкой — не ставятся вообще. */
+  skipped_resource_packs: ResourcePackSelection[];
   /** План слоя совместимости — только для свежей цели (`targetIsFresh`). */
   compat_plan_path?: string | null;
 }

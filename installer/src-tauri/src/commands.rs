@@ -469,7 +469,7 @@ async fn deploy_into(
             } else {
                 enter_stage(&overall, "resourcepacks", totals.resourcepacks, 0);
             }
-            // Loose-ресурспаки — в `resourcepacks/` (до оверлея: оверлей их
+            // Ресурспаки — в `resourcepacks/` (до оверлея: оверлей их
             // пропускает, чтобы не оставался дубль папки пака в корне игры).
             if !plan.resource_packs.is_empty() {
                 let packs = deploy::deploy_resourcepacks(
@@ -496,17 +496,13 @@ async fn deploy_into(
             }
             // Оверлей кастомного контента — всегда: самописные скрипты/папки/
             // настройки автора обязаны встать, иначе карта сломана. Пустой
-            // прогон дешёвый.
-            let mut excluded_prefixes: Vec<String> = Vec::new();
-            let mut excluded_files: Vec<String> = Vec::new();
-            for p in &plan.resource_packs {
-                match p.kind {
-                    crate::domain::ResourcePackKind::Folder => {
-                        excluded_prefixes.push(p.source.clone())
-                    }
-                    crate::domain::ResourcePackKind::Zip => excluded_files.push(p.source.clone()),
-                }
-            }
+            // прогон дешёвый. Ресурспаки (включённые и снятые) оверлей
+            // пропускает: включённые ставит deploy_resourcepacks, снятые
+            // не ставятся вообще.
+            let (excluded_prefixes, excluded_files) = deploy::rp_exclusions(
+                &plan.resource_packs,
+                &plan.skipped_resource_packs,
+            );
             let layers_report = deploy::deploy_layers(
                 &plan.zip_path,
                 &plan.world_prefix,
@@ -1208,6 +1204,7 @@ mod tests {
             deploy_mods: false,
             wipe_mods: false,
             resource_packs: Vec::new(),
+            skipped_resource_packs: Vec::new(),
             compat_plan_path: None,
         }
     }

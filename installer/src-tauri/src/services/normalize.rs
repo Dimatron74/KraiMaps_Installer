@@ -590,17 +590,23 @@ fn detect_content_prefix(names: &[String], world_prefix: &str) -> String {
     String::new()
 }
 
-/// Loose-ресурспаки рядом с миром: папки (`<root>pack.mcmeta` + `<root>assets/…`)
-/// и zip-файлы с `pack.mcmeta` + `assets/` в корне внутреннего архива.
+/// Ресурспаки архива: папки (`<корень>pack.mcmeta` + `<корень>assets/…`) и
+/// zip-файлы с `pack.mcmeta` (+ `assets/`) в корне внутреннего архива.
 /// Поиск — как у миров через `level.dat`, только маркер другой.
 ///
-/// Исключения (не loose, ставить отдельно не надо):
+/// Пак внутри `resourcepacks/` — тоже пак: автор положил его на место, но
+/// пользователь может его не ставить (опциональные паки в модпаках), поэтому
+/// такие паки помечаются `in_place` и идут в общий список на экран проверки.
+/// Ставит их тот же код, что и loose-паки, — оверлей их пропускает.
+///
+/// Исключения (не пак, ставить отдельно не надо):
 /// - всё под `world_prefix` — встроенные (`<мир>/resources.zip`,
 ///   `<мир>/datapacks/*/pack.mcmeta`): едут вместе с миром, игра подхватывает;
-/// - всё уже под `resourcepacks/` — ставит оверлей как есть;
 /// - корень, содержащий мир (`world_prefix` начинается с него, напр. сам
 ///   `content_prefix`) — это контейнер карты, а не пак;
 /// - кандидаты без `assets/` — датапаки (у них `data/`), не наша забота.
+///   Для паков в `resourcepacks/` правило не действует: автор и так положил
+///   их в папку ресурспаков.
 ///
 /// Имена сравниваем строго в нижнем регистре Minecraft (`pack.mcmeta`,
 /// `assets`): с 1.11 игра требует строчные имена внутри паков.
@@ -614,29 +620,41 @@ fn detect_resource_packs(
     let mut packs: Vec<ResourcePackInfo> = Vec::new();
 
     // Папки: родитель каждого `pack.mcmeta`.
+    let mut roots: Vec<(usize, String)> = Vec::new();
     for (idx, raw) in names.iter().enumerate() {
         if !raw.ends_with("pack.mcmeta") || raw.ends_with('/') {
             continue;
         }
         let root = parent_prefix(raw);
         if root.is_empty() {
-            continue; // pack.mcmeta в корне архива — не loose-пак
+            continue; // pack.mcmeta в корне архива — не пак
         }
-        if raw == world_prefix || raw.starts_with(world_prefix) {
+        if raw.starts_with(world_prefix) {
             continue; // внутри мира — встроенный, едет с миром
-        }
-        if is_in_resourcepacks_tree(raw, content_prefix, overrides_alias) {
-            continue; // уже на месте — ставит оверлей
         }
         if world_prefix.starts_with(&root) {
             continue; // корень содержит мир — контейнер карты
         }
-        let assets_prefix = format!("{root}assets/");
-        if !names
+        roots.push((idx, root));
+    }
+    // Пак внутри пака — часть внешнего пака, отдельно не ставим.
+    let all_roots: Vec<String> = roots.iter().map(|(_, root)| root.clone()).collect();
+    roots.retain(|(_, root)| {
+        !all_roots
             .iter()
-            .any(|n| *n == assets_prefix || n.starts_with(&assets_prefix))
-        {
-            continue; // нет assets/ — датапак или мусор
+            .any(|other| other != root && root.starts_with(other.as_str()))
+    });
+
+    for (idx, root) in roots {
+        let in_place = is_in_resourcepacks_tree(&root, content_prefix, overrides_alias);
+        if !in_place {
+            let assets_prefix = format!("{root}assets/");
+            if !names
+                .iter()
+                .any(|n| *n == assets_prefix || n.starts_with(&assets_prefix))
+            {
+                continue; // нет assets/ — датапак или мусор
+            }
         }
         let name = root
             .trim_end_matches('/')
@@ -652,6 +670,7 @@ fn detect_resource_packs(
             source: root,
             kind: ResourcePackKind::Folder,
             description,
+            in_place,
         });
     }
 
@@ -664,17 +683,18 @@ fn detect_resource_packs(
         if raw.starts_with(world_prefix) {
             continue; // внутри мира — встроенный resources.zip
         }
-        if is_in_resourcepacks_tree(raw, content_prefix, overrides_alias) {
-            continue; // уже на месте — ставит оверлей файлом
-        }
-        if folder_roots.iter().any(|r| raw != r && raw.starts_with(r)) {
+        if folder_roots.iter().any(|r| raw.starts_with(r.as_str())) {
             continue; // zip внутри папки-пака — часть пака
         }
+        let in_place = is_in_resourcepacks_tree(raw, content_prefix, overrides_alias);
         let Some(inner) = read_inner_zip(archive, idx)? else {
             continue; // не читается как zip или не пак — не наше
         };
-        if !inner.has_pack_mcmeta || !inner.has_assets {
+        if !inner.has_pack_mcmeta {
             continue;
+        }
+        if !in_place && !inner.has_assets {
+            continue; // вне resourcepacks/ без assets/ — не ресурспак
         }
         let name = raw.rsplit('/').next().unwrap_or(raw).to_string();
         packs.push(ResourcePackInfo {
@@ -682,6 +702,7 @@ fn detect_resource_packs(
             source: raw.clone(),
             kind: ResourcePackKind::Zip,
             description: inner.description,
+            in_place,
         });
     }
 
@@ -689,9 +710,9 @@ fn detect_resource_packs(
     Ok(packs)
 }
 
-/// Запись уже лежит в дереве `resourcepacks/` (от корня контента с учётом
-/// alias `overrides/` либо рядом с обёрткой у корня архива): её ставит
-/// оверлей, отдельным паком не считаем.
+/// Запись лежит в дереве `resourcepacks/` (от корня контента с учётом
+/// alias `overrides/` либо рядом с обёрткой у корня архива): автор уже
+/// положил пак на место. Ставит его `deploy_resourcepacks`, оверлей — нет.
 fn is_in_resourcepacks_tree(raw: &str, content_prefix: &str, overrides_alias: bool) -> bool {
     if let Some(rel) = content_rel(raw, content_prefix, overrides_alias) {
         return rel == "resourcepacks" || rel.starts_with("resourcepacks/");

@@ -1813,6 +1813,7 @@ mod tests {
             resource_packs: vec![ResourcePackSelection {
                 source: "Story/".into(), name: "Story".into(), kind: ResourcePackKind::Folder,
             }],
+            skipped_resource_packs: Vec::new(),
         };
         protect_target_content_paths(&target, &plan_path, &temp,
             deploy::content_paths(&map_plan, &world_name).expect("map destinations"))

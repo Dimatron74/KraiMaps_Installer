@@ -517,8 +517,8 @@ pub struct PackAnalysis {
     /// В корне контента лежит `modrinth.index.json`: ведущий `overrides/`
     /// это псевдоним корня, а не папка для копирования.
     pub overrides_alias: bool,
-    /// Loose-ресурспаки рядом с миром (папки и zip вне `world_prefix`
-    /// и вне `resourcepacks/`). Ставятся в `resourcepacks/` цели;
+    /// Ресурспаки архива: loose-паки рядом с миром и паки, уже лежащие в
+    /// `resourcepacks/` (`in_place`). Ставятся в `resourcepacks/` цели;
     /// выбор пользователя (галочки) фронт присылает в плане деплоя.
     #[serde(default)]
     pub resource_packs: Vec<ResourcePackInfo>,
@@ -555,7 +555,7 @@ pub enum ResourcePackKind {
     Zip,
 }
 
-/// Ресурспак, найденный рядом с миром (вне `world_prefix`).
+/// Ресурспак, найденный в архиве карты.
 /// Маркер — `pack.mcmeta` (+ `assets/` отличает от датапаков, у них `data/`).
 /// Встроенные (`<мир>/resources.zip`, `<мир>/datapacks/*/pack.mcmeta`) сюда
 /// не попадают — они едут вместе с миром и игрой подхватываются сами.
@@ -569,6 +569,11 @@ pub struct ResourcePackInfo {
     /// `pack.description` из `pack.mcmeta` (best-effort, может отсутствовать:
     /// новый формат `min_format`/`max_format` вместо `pack_format` — тоже ок).
     pub description: Option<String>,
+    /// Пак уже лежит в `resourcepacks/` архива: автор положил его на место.
+    /// Ставится тем же кодом, что и loose-пак, но пользователь может его
+    /// снять — тогда пак не устанавливается вовсе.
+    #[serde(default)]
+    pub in_place: bool,
 }
 
 /// Выбор пользователя для деплоя: только включённые паки едут в план.

@@ -704,6 +704,17 @@ export const useInstallStore = defineStore('install', {
     },
 
     /**
+     * Ресурспаки с снятой галочкой: их не ставит никто — ни отдельная
+     * стадия, ни оверлей слоёв (бэкенд исключает их по этому списку).
+     */
+    skippedResourcePacks() {
+      const enabled = new Set(this.enabledResourcePacks);
+      return (this.pack?.resource_packs ?? [])
+        .filter((p) => !enabled.has(p.source))
+        .map((p) => ({ source: p.source, name: p.name, kind: p.kind }));
+    },
+
+    /**
      * Мета site-потока после pickZip (pickZip делает reset — вызывать строго
      * после него; ручной выбор файла siteMeta не ставит).
      */
@@ -1300,6 +1311,7 @@ export const useInstallStore = defineStore('install', {
             deploy_mods: pack.is_modded,
             wipe_mods: this.wipeConfirmed,
             resource_packs: this.selectedResourcePacks(),
+            skipped_resource_packs: this.skippedResourcePacks(),
             compat_plan_path: compat?.plan_path ?? null,
           },
           compat,

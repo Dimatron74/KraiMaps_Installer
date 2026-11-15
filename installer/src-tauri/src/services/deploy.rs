@@ -56,10 +56,15 @@ pub struct DeployPlan {
     pub deploy_mods: bool,
     /// Модовая карта в существующий чужой инстанс (wipe-экран подтверждён).
     pub wipe_mods: bool,
-    /// Включённые пользователем loose-ресурспаки (подмножество
+    /// Включённые пользователем ресурспаки (подмножество
     /// `PackAnalysis.resource_packs` с галочек экрана проверки).
     #[serde(default)]
     pub resource_packs: Vec<ResourcePackSelection>,
+    /// Ресурспаки, с которых пользователь снял галочку: не ставятся вообще.
+    /// Оверлей их тоже пропускает — иначе «снятый» пак всё равно уехал бы в
+    /// инстанс вместе со слоем `resourcepacks/`.
+    #[serde(default)]
+    pub skipped_resource_packs: Vec<ResourcePackSelection>,
     /// План слоя совместимости. Фронт передаёт путь только для свежей цели;
     /// бэкенд дополнительно требует пустую `mods/` (оборона в глубину).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,7 +152,8 @@ pub fn content_paths(
         let (mods, _) = mods_work(&plan.zip_path, &plan.content_prefix)?;
         paths.extend(mods.into_iter().map(|item| format!("mods/{}", item.rel)));
     }
-    let (excluded_prefixes, excluded_files) = rp_exclusions(&plan.resource_packs);
+    let (excluded_prefixes, excluded_files) =
+        rp_exclusions(&plan.resource_packs, &plan.skipped_resource_packs);
     let (layers, _) = layers_work(
         &plan.zip_path,
         &plan.world_prefix,
@@ -241,7 +247,8 @@ pub fn stage_totals(
             ResourcePackKind::Zip => rp_zip_work(&plan.zip_path, &p.source)?.size,
         };
     }
-    let (excluded_prefixes, excluded_files) = rp_exclusions(&plan.resource_packs);
+    let (excluded_prefixes, excluded_files) =
+        rp_exclusions(&plan.resource_packs, &plan.skipped_resource_packs);
     let (_, layers) = layers_work(
         &plan.zip_path,
         &plan.world_prefix,
@@ -261,12 +268,17 @@ pub fn stage_totals(
     })
 }
 
-/// Источники loose-ресурспаков плана: папки — префиксы, zip — точные пути.
+/// Источники ресурспаков плана: папки — префиксы, zip — точные пути.
 /// Оверлей слоёв пропускает их (иначе останется дубль пака в корне игры).
-fn rp_exclusions(packs: &[ResourcePackSelection]) -> (Vec<String>, Vec<String>) {
+/// Пропускаются и включённые (их ставит `deploy_resourcepacks` в
+/// `resourcepacks/`), и снятые пользователем (их не ставит никто).
+pub fn rp_exclusions(
+    enabled: &[ResourcePackSelection],
+    skipped: &[ResourcePackSelection],
+) -> (Vec<String>, Vec<String>) {
     let mut excluded_prefixes = Vec::new();
     let mut excluded_files = Vec::new();
-    for p in packs {
+    for p in enabled.iter().chain(skipped.iter()) {
         match p.kind {
             ResourcePackKind::Folder => excluded_prefixes.push(p.source.clone()),
             ResourcePackKind::Zip => excluded_files.push(p.source.clone()),
@@ -739,11 +751,13 @@ pub fn deploy_mods(
     Ok(report)
 }
 
-/// Деплой loose-ресурспаков в `resourcepacks/` цели.
+/// Деплой ресурспаков в `resourcepacks/` цели.
 /// Папка ставится папкой как есть (Minecraft принимает и папки, и zip),
 /// zip-запись — файлом без перепаковки. Конфликт — рядом с `_v2`
 /// (как миры, чужое не перезаписываем никогда). Атомарно для папок:
 /// `<Имя>.__install` → rename. Возвращает финальные имена.
+/// Источник пака может лежать где угодно в архиве (`Story/`,
+/// `resourcepacks/<Имя>/`) — сюда он попадает уже снятым/выбранным.
 pub fn deploy_resourcepacks(
     zip_path: &Path,
     packs: &[ResourcePackSelection],
@@ -854,9 +868,10 @@ pub fn deploy_layers(
     overrides_alias: bool,
     game_root: &Path,
     world_dir_name: &str,
-    // Источники loose-ресурспаков из плана: их ставит deploy_resourcepacks
-    // в `resourcepacks/`, оверлей их пропускает (иначе останется дубль
-    // `<Пак>/` в корне игры). Папки — префиксы, zip — точные пути записей.
+    // Источники ресурспаков из плана: включённые ставит deploy_resourcepacks
+    // в `resourcepacks/`, снятые не ставятся вообще. Оверлей пропускает их
+    // оба (иначе дубль пака в корне игры или «снятый» пак всё равно уедет).
+    // Папки — префиксы, zip — точные пути записей.
     excluded_prefixes: &[String],
     excluded_files: &[String],
     progress: Progress,
@@ -1053,6 +1068,7 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
             deploy_mods: true,
             wipe_mods: false,
             resource_packs: Vec::new(),
+            skipped_resource_packs: Vec::new(),
             compat_plan_path: None,
         }
     }
@@ -1097,6 +1113,7 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
                 name: "Story".into(),
                 kind: ResourcePackKind::Folder,
             }],
+            skipped_resource_packs: Vec::new(),
             compat_plan_path: None,
         };
 
@@ -1225,6 +1242,7 @@ fn incoming_hash(zip_path: &Path, index: usize) -> Result<Option<String>, Instal
             deploy_mods: true,
             wipe_mods: false,
             resource_packs: Vec::new(),
+            skipped_resource_packs: Vec::new(),
             compat_plan_path: None,
         };
         let totals = stage_totals(&plan, None, None).expect("totals");
